@@ -75,6 +75,35 @@ This starts three nodes:
 3. Enter `ws://<device-ip>:8765` (use `ws://localhost:8765` if running locally).
 4. Subscribe to `/usb_cam/image_raw` for camera feed and `/fix` for GPS.
 
+## Recording and replay
+
+### Record a session
+
+```bash
+ros2 launch roadrover_bringup record.launch.py
+```
+
+Starts all sensors and records the following topics to `~/roadrover_bags/session_<timestamp>/`:
+
+| Topic | Content |
+|-------|---------|
+| `/usb_cam/image_raw` | Raw camera frames |
+| `/usb_cam/image_raw/compressed` | Compressed camera frames |
+| `/usb_cam/camera_info` | Camera calibration |
+| `/fix` | GPS position (NavSatFix) |
+| `/vel` | GPS velocity (TwistStamped) |
+| `/time_reference` | GPS time |
+
+Stop recording with **Ctrl-C**. The bag is fully written before the process exits.
+
+### Replay a session
+
+```bash
+ros2 launch roadrover_bringup replay.launch.py bag_path:=/path/to/session_<timestamp>
+```
+
+Plays the bag back and starts foxglove_bridge on port 8765 so you can inspect it in Foxglove Studio. The `--clock` flag is passed automatically so nodes that use `/clock` stay in sync with the recorded timeline.
+
 ## Changing device paths
 
 If your camera or GPS receiver is on a different device node, edit the parameters in
