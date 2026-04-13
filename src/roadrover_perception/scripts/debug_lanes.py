@@ -77,13 +77,13 @@ def main():
 
 
     # ── Step 3: ROI mask ─────────────────────────────────────────────────
-    y_top    = int(h * 0.38)
+    y_top    = int(h * 0.45)
     y_bottom = int(h * 0.70)
     roi_pts = np.array([
-        [0,          y_bottom],
-        [int(w * 0.25), y_top],
-        [int(w * 0.75), y_top],
-        [w - 1,      y_bottom],
+        [int(w * 0.05), y_bottom],
+        [int(w * 0.28), y_top],
+        [int(w * 0.65), y_top],
+        [int(w * 0.95), y_bottom],
     ], np.int32)
     roi_vis = img.copy()
     cv2.polylines(roi_vis, [roi_pts], True, (0, 255, 0), 2)
@@ -113,9 +113,9 @@ def main():
             if x2 == x1:
                 continue
             slope = (y2 - y1) / (x2 - x1)
-            if slope < -0.2 and max(x1, x2) < w * 0.85:
+            if slope < -0.3 and (x1 + x2) / 2 < w * 0.63:
                 cv2.line(slope_vis, (x1, y1), (x2, y2), (255, 80, 0), 2)   # left
-            elif slope > 0.2 and min(x1, x2) > w * 0.15:
+            elif slope > 0.3 and (x1 + x2) / 2 > w * 0.43:
                 cv2.line(slope_vis, (x1, y1), (x2, y2), (0, 80, 255), 2)   # right
     save(out / '6_slope_filtered.jpg', slope_vis, 'slope-filtered lines')
 

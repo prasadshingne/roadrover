@@ -66,9 +66,9 @@ HOOD_CUTOFF = 0.70   # below this fraction of height = car hood
 class LaneTracker:
     """EMA-smoothed degree-2 polynomial lane tracker."""
 
-    STALE_LIMIT = 15
+    STALE_LIMIT = 25   # hold last good fit longer before giving up
 
-    def __init__(self, alpha: float = 0.35):
+    def __init__(self, alpha: float = 0.20):   # lower = smoother
         self.alpha = alpha
         self.left_poly   = None
         self.right_poly  = None
@@ -76,7 +76,7 @@ class LaneTracker:
         self._right_stale = 0
 
     def update(self, left_pts, right_pts, h, w):
-        y_top    = int(h * 0.38)
+        y_top    = int(h * 0.45)
         y_bottom = int(h * HOOD_CUTOFF)
 
         lp = self._fit(left_pts,  y_top, y_bottom, w)
@@ -108,8 +108,12 @@ class LaneTracker:
             poly = np.polyfit(ys, xs, 2)
         except np.linalg.LinAlgError:
             return None
-        # Only reject wildly out-of-bounds fits
-        margin = w * 0.30
+        # Reject physically impossible curvature — quadratic coeff too large
+        # means the curve bends more than any real road would within the ROI
+        if abs(poly[0]) > 0.003:
+            return None
+        # Reject fits that exit the image
+        margin = w * 0.25
         x_bot = np.polyval(poly, y_bottom)
         x_top = np.polyval(poly, y_top)
         if not (-margin <= x_bot <= w + margin):
@@ -141,13 +145,16 @@ def detect_lanes(img: np.ndarray, tracker: LaneTracker) -> np.ndarray:
     blur     = cv2.GaussianBlur(enhanced, (7, 7), 0)
     edges    = cv2.Canny(blur, 40, 120)
 
-    # Trapezoid ROI: road surface — below horizon, above car hood
-    y_top    = int(h * 0.38)
+    # Trapezoid ROI: road surface — below ~150-200 m range, above car hood.
+    # y_top at 45% keeps us well below the horizon where detection is noisy.
+    # Top x is shifted right ~3% to account for the camera being ~5-6" left
+    # of the car's centreline (forward axis sits right of image centre).
+    y_top    = int(h * 0.45)
     y_bottom = int(h * HOOD_CUTOFF)
     roi_pts = np.array([
         [int(w * 0.05), y_bottom],
-        [int(w * 0.38), y_top],
-        [int(w * 0.62), y_top],
+        [int(w * 0.28), y_top],
+        [int(w * 0.65), y_top],
         [int(w * 0.95), y_bottom],
     ], np.int32)
     roi_mask = np.zeros(img.shape[:2], np.uint8)
@@ -164,9 +171,10 @@ def detect_lanes(img: np.ndarray, tracker: LaneTracker) -> np.ndarray:
                 continue
             slope = (y2 - y1) / (x2 - x1)
             mid_x = (x1 + x2) / 2
-            if slope < -0.3 and mid_x < w * 0.60:
+            # Dividing line shifted right 3% for camera offset
+            if slope < -0.3 and mid_x < w * 0.63:
                 left_pts  += [(x1, y1), (x2, y2)]
-            elif slope > 0.3 and mid_x > w * 0.40:
+            elif slope > 0.3 and mid_x > w * 0.43:
                 right_pts += [(x1, y1), (x2, y2)]
 
     tracker.update(left_pts, right_pts, h, w)
