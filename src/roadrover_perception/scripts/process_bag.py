@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import math
+import warnings
 from pathlib import Path
 
 import cv2
@@ -60,27 +61,53 @@ def rotate_compressed_msg(data: bytes, msg_type):
 
 # ── Lane detection ────────────────────────────────────────────────────────────
 
-HOOD_CUTOFF = 0.70   # below this fraction of height = car hood
+HOOD_CUTOFF = 0.63   # below this fraction of height = car hood
+
+# Bird's-eye view (BEV / IPM) constants
+BEV_W          = 400
+BEV_H          = 300
+BEV_MARGIN     = 60   # left/right padding inside BEV canvas
+BEV_DRAW_EXTRA = 15   # extra BEV rows to draw below fit region (pulls line toward hood)
+
+
+def _bev_transforms(h: int, w: int):
+    """Return (M_bev, M_inv) perspective transforms for a frame of size h×w."""
+    y_top    = int(h * 0.45)
+    y_bottom = int(h * HOOD_CUTOFF)
+    # Source: same trapezoid as the ROI mask
+    src = np.float32([
+        [w * 0.05, y_bottom],
+        [w * 0.28, y_top],
+        [w * 0.65, y_top],
+        [w * 0.95, y_bottom],
+    ])
+    # Destination: rectangle in BEV space (bottom of image = near, top = far)
+    dst = np.float32([
+        [BEV_MARGIN,         BEV_H],
+        [BEV_MARGIN,         0],
+        [BEV_W - BEV_MARGIN, 0],
+        [BEV_W - BEV_MARGIN, BEV_H],
+    ])
+    M_bev = cv2.getPerspectiveTransform(src, dst)
+    M_inv = cv2.getPerspectiveTransform(dst, src)
+    return M_bev, M_inv
 
 
 class LaneTracker:
-    """EMA-smoothed degree-2 polynomial lane tracker."""
+    """EMA-smoothed degree-2 polynomial lane tracker (operates in BEV space)."""
 
-    STALE_LIMIT = 25   # hold last good fit longer before giving up
+    STALE_LIMIT = 15
 
-    def __init__(self, alpha: float = 0.20):   # lower = smoother
+    def __init__(self, alpha: float = 0.20):
         self.alpha = alpha
-        self.left_poly   = None
-        self.right_poly  = None
+        self.left_poly    = None
+        self.right_poly   = None
         self._left_stale  = 0
         self._right_stale = 0
 
-    def update(self, left_pts, right_pts, h, w):
-        y_top    = int(h * 0.45)
-        y_bottom = int(h * HOOD_CUTOFF)
-
-        lp = self._fit(left_pts,  y_top, y_bottom, w)
-        rp = self._fit(right_pts, y_top, y_bottom, w)
+    def update(self, left_pts, right_pts):
+        lp = self._fit(left_pts,  side='left')
+        rp = self._fit(right_pts, side='right')
 
         if lp is not None:
             self.left_poly   = lp if self.left_poly  is None else \
@@ -100,55 +127,117 @@ class LaneTracker:
             if self._right_stale > self.STALE_LIMIT:
                 self.right_poly = None
 
-    def _fit(self, pts, y_top, y_bottom, w):
-        if len(pts) < 4:
+    def _fit(self, pts, side: str):
+        if len(pts) < 6:
             return None
         xs, ys = zip(*pts)
+        xs, ys = np.array(xs, dtype=float), np.array(ys, dtype=float)
+        # Require vertical spread ≥ 20% of BEV height
+        if (ys.max() - ys.min()) < BEV_H * 0.20:
+            return None
         try:
-            poly = np.polyfit(ys, xs, 2)
-        except np.linalg.LinAlgError:
+            with warnings.catch_warnings():
+                warnings.filterwarnings('error', category=np.RankWarning)
+                poly = np.polyfit(ys, xs, 2)
+        except (np.linalg.LinAlgError, np.RankWarning):
             return None
-        # Reject physically impossible curvature — quadratic coeff too large
-        # means the curve bends more than any real road would within the ROI
-        if abs(poly[0]) > 0.003:
+        # Curvature sanity in BEV space (pixels roughly uniform → higher limit)
+        if abs(poly[0]) > 0.01:
             return None
-        # Reject fits that exit the image
-        margin = w * 0.25
-        x_bot = np.polyval(poly, y_bottom)
-        x_top = np.polyval(poly, y_top)
-        if not (-margin <= x_bot <= w + margin):
+        # Base-of-frame x must land inside expected half of the image
+        x_base = np.polyval(poly, BEV_H)
+        if side == 'left'  and not (BEV_MARGIN * 0.5 <= x_base <= BEV_W * 0.55):
             return None
-        if not (-margin <= x_top <= w + margin):
+        if side == 'right' and not (BEV_W * 0.45 <= x_base <= BEV_W - BEV_MARGIN * 0.5):
             return None
         return poly
 
 
-def _poly_curve(poly, y_bottom, y_top, w, n=40):
-    """Evaluate a polynomial along y, return Nx1x2 array for cv2.polylines."""
-    ys = np.linspace(y_bottom, y_top, n)
-    xs = np.clip(np.polyval(poly, ys), 0, w - 1)
-    return np.column_stack([xs, ys]).astype(np.int32).reshape(-1, 1, 2)
-
-
-def detect_lanes(img: np.ndarray, tracker: LaneTracker) -> np.ndarray:
+def _bev_sliding_window(bev_binary: np.ndarray, tracker: LaneTracker,
+                         n_windows: int = 9, margin: int = 30, minpix: int = 10):
     """
-    Detect lane lines, update the tracker with EMA smoothing, and return
-    a black overlay with smooth curved lane lines and filled lane area.
+    Sliding window lane-pixel search in BEV binary edge image.
+    Seed from EMA polynomial when available; cold-start via histogram.
+    Returns (left_pts, right_pts) as lists of (x, y) in BEV space.
+    """
+    mid = BEV_W // 2
+
+    # ── Seed x positions ────────────────────────────────────────────────────
+    if tracker.left_poly is not None:
+        leftx_cur = int(np.clip(np.polyval(tracker.left_poly, BEV_H),
+                                BEV_MARGIN, mid))
+    else:
+        hist = np.sum(bev_binary[BEV_H // 2:, :mid], axis=0).astype(np.float32)
+        leftx_cur = int(np.argmax(hist)) if hist.max() >= minpix else None
+
+    if tracker.right_poly is not None:
+        rightx_cur = int(np.clip(np.polyval(tracker.right_poly, BEV_H),
+                                 mid, BEV_W - BEV_MARGIN))
+    else:
+        hist = np.sum(bev_binary[BEV_H // 2:, mid:], axis=0).astype(np.float32)
+        peak = int(np.argmax(hist))
+        rightx_cur = peak + mid if hist.max() >= minpix else None
+
+    nz  = bev_binary.nonzero()
+    nzy = np.array(nz[0])
+    nzx = np.array(nz[1])
+
+    left_pts, right_pts = [], []
+    win_h = BEV_H // n_windows
+
+    for win in range(n_windows):
+        y_lo = BEV_H - (win + 1) * win_h
+        y_hi = BEV_H - win * win_h
+
+        if leftx_cur is not None:
+            inds = ((nzy >= y_lo) & (nzy < y_hi) &
+                    (nzx >= leftx_cur - margin) & (nzx < leftx_cur + margin)).nonzero()[0]
+            if len(inds) >= minpix:
+                xs = nzx[inds]
+                left_pts.extend(zip(xs.tolist(), nzy[inds].tolist()))
+                leftx_cur = int(np.clip(int(np.mean(xs)), BEV_MARGIN, mid))
+
+        if rightx_cur is not None:
+            inds = ((nzy >= y_lo) & (nzy < y_hi) &
+                    (nzx >= rightx_cur - margin) & (nzx < rightx_cur + margin)).nonzero()[0]
+            if len(inds) >= minpix:
+                xs = nzx[inds]
+                right_pts.extend(zip(xs.tolist(), nzy[inds].tolist()))
+                rightx_cur = int(np.clip(int(np.mean(xs)), mid, BEV_W - BEV_MARGIN))
+
+    return left_pts, right_pts
+
+
+def _bev_poly_to_image(poly: np.ndarray, M_inv: np.ndarray, n: int = 50):
+    """Warp a BEV-space polynomial back to image-space point array for drawing."""
+    ys = np.linspace(0, BEV_H - 1 + BEV_DRAW_EXTRA, n)
+    xs = np.clip(np.polyval(poly, ys), 0, BEV_W - 1)
+    bev_pts = np.column_stack([xs, ys]).astype(np.float32).reshape(-1, 1, 2)
+    img_pts = cv2.perspectiveTransform(bev_pts, M_inv)
+    return img_pts.astype(np.int32)
+
+
+def detect_lanes(img: np.ndarray, tracker: LaneTracker,
+                  det_boxes=None) -> np.ndarray:
+    """
+    Detect lane lines via BEV perspective warp + sliding window search.
+    det_boxes: YOLO Boxes object (optional) — detected vehicle regions are
+               zeroed out of the edge image so they don't pollute lane pixels.
+    Returns a black overlay with smooth curved lane lines and filled lane area.
     """
     h, w = img.shape[:2]
     overlay = np.zeros_like(img)
 
-    # CLAHE + grayscale edges — robust in overcast/wet conditions
+    # ── Edge detection ───────────────────────────────────────────────────────
     gray     = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
     blur     = cv2.GaussianBlur(enhanced, (7, 7), 0)
     edges    = cv2.Canny(blur, 40, 120)
 
-    # Trapezoid ROI: road surface — below ~150-200 m range, above car hood.
-    # y_top at 45% keeps us well below the horizon where detection is noisy.
-    # Top x is shifted right ~3% to account for the camera being ~5-6" left
-    # of the car's centreline (forward axis sits right of image centre).
+    # ── Trapezoid ROI mask ───────────────────────────────────────────────────
+    # y_top=45%: below horizon (noisy far-field); y_bottom=63%: above hood.
+    # Top corners shifted right to account for camera ~5–6" left of centreline.
     y_top    = int(h * 0.45)
     y_bottom = int(h * HOOD_CUTOFF)
     roi_pts = np.array([
@@ -161,41 +250,38 @@ def detect_lanes(img: np.ndarray, tracker: LaneTracker) -> np.ndarray:
     cv2.fillPoly(roi_mask, [roi_pts], 255)
     masked = cv2.bitwise_and(edges, roi_mask)
 
-    lines = cv2.HoughLinesP(masked, 1, np.pi / 180, 15,
-                            minLineLength=10, maxLineGap=300)
+    # ── Blank out detected vehicles so their edges don't fool the lane fit ───
+    if det_boxes is not None and len(det_boxes):
+        pad = 10
+        for x1, y1, x2, y2 in det_boxes.xyxy.cpu().numpy().astype(int)[:, :4]:
+            masked[max(0, y1 - pad):min(h, y2 + pad),
+                   max(0, x1 - pad):min(w, x2 + pad)] = 0
 
-    left_pts, right_pts = [], []
-    if lines is not None:
-        for x1, y1, x2, y2 in lines[:, 0]:
-            if x2 == x1:
-                continue
-            slope = (y2 - y1) / (x2 - x1)
-            mid_x = (x1 + x2) / 2
-            # Dividing line shifted right 3% for camera offset
-            if slope < -0.3 and mid_x < w * 0.63:
-                left_pts  += [(x1, y1), (x2, y2)]
-            elif slope > 0.3 and mid_x > w * 0.43:
-                right_pts += [(x1, y1), (x2, y2)]
+    # ── Perspective warp → BEV ───────────────────────────────────────────────
+    M_bev, M_inv = _bev_transforms(h, w)
+    bev = cv2.warpPerspective(masked, M_bev, (BEV_W, BEV_H))
+    # Thicken 1-px Canny edges so windows catch them reliably
+    bev = cv2.dilate(bev, np.ones((3, 3), np.uint8), iterations=1)
 
-    tracker.update(left_pts, right_pts, h, w)
+    # ── Sliding window in BEV space ──────────────────────────────────────────
+    left_pts, right_pts = _bev_sliding_window(bev, tracker)
+    tracker.update(left_pts, right_pts)
 
     lp = tracker.left_poly
     rp = tracker.right_poly
 
+    # ── Draw back in image space via inverse warp ────────────────────────────
     if lp is not None and rp is not None:
-        left_curve  = _poly_curve(lp, y_bottom, y_top, w)
-        right_curve = _poly_curve(rp, y_bottom, y_top, w)
-        # filled polygon between the two curves
-        fill_pts = np.vstack([left_curve, right_curve[::-1]])
+        left_img  = _bev_poly_to_image(lp, M_inv)
+        right_img = _bev_poly_to_image(rp, M_inv)
+        fill_pts  = np.vstack([left_img, right_img[::-1]])
         cv2.fillPoly(overlay, [fill_pts], (0, 180, 0))
-        cv2.polylines(overlay, [left_curve],  False, (255, 80,   0), 3)
-        cv2.polylines(overlay, [right_curve], False, (0,   80, 255), 3)
+        cv2.polylines(overlay, [left_img],  False, (255, 80,   0), 3)
+        cv2.polylines(overlay, [right_img], False, (0,   80, 255), 3)
     elif lp is not None:
-        cv2.polylines(overlay, [_poly_curve(lp, y_bottom, y_top, w)],
-                      False, (255, 80, 0), 3)
+        cv2.polylines(overlay, [_bev_poly_to_image(lp, M_inv)], False, (255, 80, 0), 3)
     elif rp is not None:
-        cv2.polylines(overlay, [_poly_curve(rp, y_bottom, y_top, w)],
-                      False, (0, 80, 255), 3)
+        cv2.polylines(overlay, [_bev_poly_to_image(rp, M_inv)], False, (0, 80, 255), 3)
 
     return overlay
 
@@ -304,9 +390,8 @@ def main():
                 h_img = img.shape[0]
                 hood_y = int(h_img * HOOD_CUTOFF)
 
-                # both run on the clean rotated frame
-                lane_overlay = detect_lanes(img, tracker)
-                det_results  = model(img, verbose=False)[0]
+                # YOLO first — boxes are used to mask vehicles out of lane detection
+                det_results = model(img, verbose=False)[0]
 
                 # filter out detections whose centre is in the car hood region
                 if det_results.boxes is not None and len(det_results.boxes):
@@ -314,6 +399,8 @@ def main():
                                 (det_results.boxes.xyxy[:, 3] - det_results.boxes.xyxy[:, 1]) / 2
                     keep = centres_y < hood_y
                     det_results.boxes = det_results.boxes[keep]
+
+                lane_overlay = detect_lanes(img, tracker, det_results.boxes)
 
                 # compose: YOLO boxes on clean frame, then blend lane overlay
                 annotated = det_results.plot()
