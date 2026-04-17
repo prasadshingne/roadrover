@@ -24,12 +24,17 @@ import numpy as np
 import rosbag2_py
 from rclpy.serialization import deserialize_message, serialize_message
 from rosidl_runtime_py.utilities import get_message
-from sensor_msgs.msg import CompressedImage, Image
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import CompressedImage, Image, Imu
+from std_msgs.msg import Header
 
 COMPRESSED_TOPIC = '/usb_cam/image_raw/compressed'
 RAW_TOPIC        = '/usb_cam/image_raw'
 ANNOTATED_TOPIC  = '/perception/image_annotated'
 VEL_TOPIC        = '/vel'
+GPS_TOPIC        = '/fix'
+EGO_ODOM_TOPIC   = '/ego/odometry'
+EGO_IMU_TOPIC    = '/ego/imu'
 
 
 # ── Image rotation helpers ────────────────────────────────────────────────────
@@ -57,6 +62,96 @@ def rotate_compressed_msg(data: bytes, msg_type):
     if ok:
         msg.data = encoded.tobytes()
     return serialize_message(msg), img
+
+
+# ── Ego state estimation ──────────────────────────────────────────────────────
+
+class EgoStateEstimator:
+    """
+    Derives heading, yaw rate, and longitudinal/lateral acceleration from /vel.
+    /vel is geometry_msgs/TwistWithCovarianceStamped published by nmea_navsat_driver:
+      linear.x = east velocity (m/s), linear.y = north velocity (m/s).
+    No IMU on this rover — everything is computed from GPS velocity.
+    """
+    _ALPHA     = 0.15   # EMA smoothing for derivatives (lower = smoother)
+    _MIN_SPEED = 0.5    # m/s — below this heading is unreliable; hold last value
+
+    def __init__(self):
+        self._t_prev       = None
+        self._speed_prev   = 0.0
+        self._heading_prev = None   # ENU yaw: atan2(vy_north, vx_east)
+        self.yaw_rate      = 0.0    # rad/s, EMA-smoothed
+        self.lon_accel     = 0.0    # m/s², along direction of travel
+        self.lat_accel     = 0.0    # m/s², centripetal (speed × yaw_rate)
+
+    def _make_header(self, timestamp_ns: int, frame_id: str) -> Header:
+        h = Header()
+        h.frame_id     = frame_id
+        h.stamp.sec    = int(timestamp_ns // 1_000_000_000)
+        h.stamp.nanosec = int(timestamp_ns % 1_000_000_000)
+        return h
+
+    def update(self, vel_msg, timestamp_ns: int):
+        """
+        Process one /vel message. Returns (Odometry, Imu) ready to serialize.
+        """
+        vx_e  = vel_msg.twist.linear.x   # east  (m/s)
+        vy_n  = vel_msg.twist.linear.y   # north (m/s)
+        speed = math.sqrt(vx_e ** 2 + vy_n ** 2)
+        t_s   = timestamp_ns * 1e-9
+
+        heading = None
+        if speed >= self._MIN_SPEED:
+            heading = math.atan2(vy_n, vx_e)   # ENU yaw (rad)
+
+        if self._t_prev is not None:
+            dt = t_s - self._t_prev
+            if dt > 0.0:
+                # Longitudinal acceleration: d(speed)/dt
+                a_lon_raw  = (speed - self._speed_prev) / dt
+                self.lon_accel = (self._ALPHA * a_lon_raw +
+                                  (1 - self._ALPHA) * self.lon_accel)
+
+                # Yaw rate: d(heading)/dt with angle unwrapping
+                if heading is not None and self._heading_prev is not None:
+                    d_yaw = heading - self._heading_prev
+                    if d_yaw >  math.pi: d_yaw -= 2 * math.pi
+                    if d_yaw < -math.pi: d_yaw += 2 * math.pi
+                    yaw_rate_raw = d_yaw / dt
+                    self.yaw_rate = (self._ALPHA * yaw_rate_raw +
+                                     (1 - self._ALPHA) * self.yaw_rate)
+
+                # Lateral acceleration (centripetal): v × ω
+                self.lat_accel = speed * self.yaw_rate
+
+        self._t_prev     = t_s
+        self._speed_prev = speed
+        if heading is not None:
+            self._heading_prev = heading
+
+        yaw = self._heading_prev if self._heading_prev is not None else 0.0
+
+        # ── nav_msgs/Odometry ────────────────────────────────────────────
+        odom = Odometry()
+        odom.header          = self._make_header(timestamp_ns, 'odom')
+        odom.child_frame_id  = 'base_link'
+        half_yaw = yaw / 2.0
+        odom.pose.pose.orientation.x = 0.0
+        odom.pose.pose.orientation.y = 0.0
+        odom.pose.pose.orientation.z = math.sin(half_yaw)
+        odom.pose.pose.orientation.w = math.cos(half_yaw)
+        odom.twist.twist.linear.x   = speed
+        odom.twist.twist.angular.z  = self.yaw_rate
+
+        # ── sensor_msgs/Imu ──────────────────────────────────────────────
+        imu = Imu()
+        imu.header = self._make_header(timestamp_ns, 'base_link')
+        imu.orientation_covariance[0] = -1.0   # orientation not provided
+        imu.angular_velocity.z        = self.yaw_rate
+        imu.linear_acceleration.x     = self.lon_accel
+        imu.linear_acceleration.y     = self.lat_accel
+
+        return odom, imu
 
 
 # ── Lane detection ────────────────────────────────────────────────────────────
@@ -360,8 +455,19 @@ def main():
         type='sensor_msgs/msg/CompressedImage',
         serialization_format='cdr',
     ))
+    writer.create_topic(rosbag2_py.TopicMetadata(
+        name=EGO_ODOM_TOPIC,
+        type='nav_msgs/msg/Odometry',
+        serialization_format='cdr',
+    ))
+    writer.create_topic(rosbag2_py.TopicMetadata(
+        name=EGO_IMU_TOPIC,
+        type='sensor_msgs/msg/Imu',
+        serialization_format='cdr',
+    ))
 
     tracker     = LaneTracker(alpha=0.25)
+    ego_est     = EgoStateEstimator()
     speed_ms    = 0.0
     frame_count = 0
     total       = 0
@@ -374,6 +480,9 @@ def main():
             speed_ms = math.sqrt(
                 msg.twist.linear.x ** 2 + msg.twist.linear.y ** 2)
             writer.write(topic, data, timestamp)
+            odom, imu = ego_est.update(msg, timestamp)
+            writer.write(EGO_ODOM_TOPIC, serialize_message(odom), timestamp)
+            writer.write(EGO_IMU_TOPIC,  serialize_message(imu),  timestamp)
 
         elif topic == RAW_TOPIC:
             # rotate raw image and write to same topic
