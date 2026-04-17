@@ -116,6 +116,8 @@ python3 src/roadrover_perception/scripts/process_bag.py ~/roadrover_bags/session
 python3 src/roadrover_perception/scripts/process_bag.py <bag> --output <out_bag>
 ```
 
+![Lane and object detection](docs/Lane_and_Object_Detection.png)
+
 ### What it does
 
 | Step | Detail |
@@ -145,6 +147,8 @@ All signals are derived from the GPS `/vel` topic (no IMU on this rover):
 | Lateral accel | Speed + yaw rate | `speed × yaw_rate` (centripetal) |
 
 ### Viewing in Foxglove
+
+![Ego state plots in Foxglove](docs/Ego_State.png)
 
 Open the processed bag in Foxglove Studio (File → Open local file). Useful panel configurations:
 
