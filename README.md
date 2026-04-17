@@ -1,6 +1,6 @@
 # roadrover
 
-A ROS 2 Humble project for data collection, perception, lane detection, and localization, intended to run on a Raspberry Pi.
+A ROS 2 Humble project for data collection, offline perception, lane detection, object detection, and ego state estimation, intended to run on a Raspberry Pi.
 
 ## Hardware
 
@@ -103,6 +103,83 @@ ros2 launch roadrover_bringup replay.launch.py bag_path:=/path/to/session_<times
 ```
 
 Plays the bag back and starts foxglove_bridge on port 8765 so you can inspect it in Foxglove Studio. The `--clock` flag is passed automatically so nodes that use `/clock` stay in sync with the recorded timeline.
+
+## Offline perception pipeline
+
+`src/roadrover_perception/scripts/process_bag.py` reads an original recorded bag, runs the full perception stack, and writes a new bag:
+
+```bash
+# From the repo root (YOLOv8s weights must be present as yolov8s.pt)
+python3 src/roadrover_perception/scripts/process_bag.py ~/roadrover_bags/session_<timestamp>
+
+# Optionally specify the output path
+python3 src/roadrover_perception/scripts/process_bag.py <bag> --output <out_bag>
+```
+
+### What it does
+
+| Step | Detail |
+|------|--------|
+| Image rotation | All camera frames rotated 180° in-place |
+| Object detection | YOLOv8s on GPU; detections in the car hood region are filtered out |
+| Lane detection | Bird's-eye view (BEV) perspective warp + sliding window search; EMA-smoothed degree-2 polynomial per lane |
+| Ego state estimation | Heading, yaw rate, longitudinal and lateral acceleration derived from GPS velocity |
+
+### Output topics
+
+| Topic | Type | Content |
+|-------|------|---------|
+| `/perception/image_annotated` | `CompressedImage` | YOLO boxes + lane overlay + speed |
+| `/ego/odometry` | `nav_msgs/Odometry` | Heading (quaternion), speed, yaw rate |
+| `/ego/imu` | `sensor_msgs/Imu` | Yaw rate, longitudinal accel, lateral accel |
+
+### Ego state signals
+
+All signals are derived from the GPS `/vel` topic (no IMU on this rover):
+
+| Signal | Source | Method |
+|--------|--------|--------|
+| Heading | `/vel` east/north components | `atan2(vy_north, vx_east)` |
+| Yaw rate | Heading | Finite diff + EMA smoothing |
+| Longitudinal accel | Speed | `d(speed)/dt` + EMA |
+| Lateral accel | Speed + yaw rate | `speed × yaw_rate` (centripetal) |
+
+### Viewing in Foxglove
+
+Open the processed bag in Foxglove Studio (File → Open local file). Useful panel configurations:
+
+- **Image** panel → `/perception/image_annotated` — annotated video with lanes and YOLO boxes
+- **Map** panel → `/fix` — GPS track on a satellite map
+- **Plot** panel — add series for time-series signals:
+
+| Signal | Topic | Field path |
+|--------|-------|------------|
+| Speed (m/s) | `/ego/odometry` | `twist.twist.linear.x` |
+| Yaw rate (rad/s) | `/ego/odometry` | `twist.twist.angular.z` |
+| Longitudinal accel | `/ego/imu` | `linear_acceleration.x` |
+| Lateral accel | `/ego/imu` | `linear_acceleration.y` |
+
+### Lane detection debug tool
+
+Inspect the BEV pipeline on a single frame without running the full bag:
+
+```bash
+python3 src/roadrover_perception/scripts/debug_lanes.py <bag_path> --frame 50 --out-dir /tmp/lane_debug
+```
+
+Output images in `/tmp/lane_debug/`:
+
+| File | Content |
+|------|---------|
+| `0_original.jpg` | Raw rotated frame |
+| `1_clahe.jpg` | CLAHE-enhanced grayscale |
+| `2_edges.jpg` | Canny edges |
+| `3_roi.jpg` | Trapezoid ROI boundary |
+| `4_masked_edges.jpg` | Edges inside ROI |
+| `5_bev_edges.jpg` | Edges warped to bird's-eye view |
+| `6_bev_windows.jpg` | Sliding windows in BEV |
+| `7_bev_fit.jpg` | Polynomial fit in BEV |
+| `8_lane_overlay.jpg` | Lanes warped back to image space |
 
 ## Changing device paths
 
