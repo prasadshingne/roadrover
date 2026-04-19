@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import math
+import pickle
 import warnings
 from pathlib import Path
 
@@ -24,17 +25,21 @@ import numpy as np
 import rosbag2_py
 from rclpy.serialization import deserialize_message, serialize_message
 from rosidl_runtime_py.utilities import get_message
+from foxglove_msgs.msg import GeoJSON
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import CompressedImage, Image, Imu
-from std_msgs.msg import Header
+from sensor_msgs.msg import CompressedImage, Image, Imu, NavSatFix
+from std_msgs.msg import Header, String
 
 COMPRESSED_TOPIC = '/usb_cam/image_raw/compressed'
 RAW_TOPIC        = '/usb_cam/image_raw'
 ANNOTATED_TOPIC  = '/perception/image_annotated'
 VEL_TOPIC        = '/vel'
-GPS_TOPIC        = '/fix'
-EGO_ODOM_TOPIC   = '/ego/odometry'
-EGO_IMU_TOPIC    = '/ego/imu'
+GPS_TOPIC             = '/fix'
+EGO_ODOM_TOPIC        = '/ego/odometry'
+EGO_IMU_TOPIC         = '/ego/imu'
+EGO_MATCHED_FIX_TOPIC = '/ego/matched_fix'
+EGO_LANE_INFO_TOPIC   = '/ego/lane_info'
+MAP_ROADS_TOPIC       = '/map/roads'
 
 
 # ── Image rotation helpers ────────────────────────────────────────────────────
@@ -62,6 +67,106 @@ def rotate_compressed_msg(data: bytes, msg_type):
     if ok:
         msg.data = encoded.tobytes()
     return serialize_message(msg), img
+
+
+# ── Map matching ──────────────────────────────────────────────────────────────
+
+class MapMatcher:
+    """
+    Matches GPS fixes to the nearest OSM road edge and estimates lane number.
+    Uses an osmnx graph pickled by make_map.py.
+    Lane estimation assumes right-hand traffic, ~3.5 m lane width.
+    """
+    LANE_WIDTH = 3.5   # metres
+
+    def __init__(self, graph_path: str):
+        import osmnx as ox
+        with open(graph_path, 'rb') as f:
+            self._G = pickle.load(f)
+        self._ox = ox
+
+    def match(self, lat: float, lon: float, timestamp_ns: int):
+        """
+        Returns (matched_NavSatFix, lane_info_String) for the given GPS position.
+        """
+        ox = self._ox
+        G  = self._G
+
+        # ── Nearest edge ────────────────────────────────────────────────────
+        (u, v, key), dist_deg = ox.nearest_edges(
+            G, X=lon, Y=lat, return_dist=True)
+        edge = G[u][v][key]
+
+        # ── Road name ───────────────────────────────────────────────────────
+        name = edge.get('name', '')
+        if isinstance(name, list):
+            name = name[0]
+        name = name or edge.get('highway', 'unknown road')
+        if isinstance(name, list):
+            name = name[0]
+
+        # ── Snap GPS point onto edge geometry ───────────────────────────────
+        from shapely.geometry import Point
+        geom  = edge.get('geometry')
+        point = Point(lon, lat)
+
+        if geom is not None:
+            proj_dist  = geom.project(point)
+            nearest_pt = geom.interpolate(proj_dist)
+
+            # Signed lateral offset: positive = left of road direction
+            delta     = 1e-5
+            p_before  = geom.interpolate(max(0.0, proj_dist - delta))
+            p_after   = geom.interpolate(min(geom.length, proj_dist + delta))
+            tx, ty    = p_after.x - p_before.x, p_after.y - p_before.y  # tangent
+            ex, ey    = lon - nearest_pt.x,      lat - nearest_pt.y      # ego vec
+            cross     = tx * ey - ty * ex   # +ve = left of travel direction
+
+            # Convert degrees → metres (equirectangular approx)
+            m_per_deg_lat = 111_320.0
+            m_per_deg_lon = 111_320.0 * math.cos(math.radians(lat))
+            lateral_m     = math.sqrt((ex * m_per_deg_lon) ** 2 +
+                                      (ey * m_per_deg_lat) ** 2)
+            lateral_m    *= 1.0 if cross >= 0 else -1.0
+
+            snap_lat, snap_lon = nearest_pt.y, nearest_pt.x
+        else:
+            # Edge has no geometry: use node positions as snap point
+            node_data  = G.nodes[u]
+            snap_lat   = node_data['y']
+            snap_lon   = node_data['x']
+            lateral_m  = 0.0
+
+        # ── Lane estimate ───────────────────────────────────────────────────
+        lanes_raw = edge.get('lanes', 2)
+        try:
+            total_lanes = int(lanes_raw[0] if isinstance(lanes_raw, list)
+                              else lanes_raw)
+        except (ValueError, TypeError):
+            total_lanes = 2
+        # Right-hand traffic: lane 1 is rightmost (most negative lateral offset)
+        # Road centerline sits at total_lanes/2 * LANE_WIDTH to the left of lane 1
+        lane_offset = total_lanes / 2.0 * self.LANE_WIDTH + lateral_m
+        lane_num    = max(1, min(total_lanes, int(lane_offset / self.LANE_WIDTH) + 1))
+
+        # ── Build ROS messages ──────────────────────────────────────────────
+        h = Header()
+        h.frame_id      = 'map'
+        h.stamp.sec     = int(timestamp_ns // 1_000_000_000)
+        h.stamp.nanosec = int(timestamp_ns %  1_000_000_000)
+
+        fix               = NavSatFix()
+        fix.header        = h
+        fix.latitude      = snap_lat
+        fix.longitude     = snap_lon
+        fix.altitude      = 0.0
+        fix.status.status = 0   # STATUS_FIX
+
+        info      = String()
+        info.data = (f'{name} | lane {lane_num}/{total_lanes} | '
+                     f'offset {lateral_m:+.1f} m')
+
+        return fix, info
 
 
 # ── Ego state estimation ──────────────────────────────────────────────────────
@@ -413,6 +518,8 @@ def main():
     ap.add_argument('bag_path', help='Path to original rosbag2 directory')
     ap.add_argument('--output', default=None,
                     help='Output bag path (default: <input>_processed)')
+    ap.add_argument('--map-graph', default=None,
+                    help='Path to map_graph.pkl from make_map.py (enables map matching)')
     args = ap.parse_args()
 
     bag_path    = str(Path(args.bag_path).resolve())
@@ -466,14 +573,50 @@ def main():
         serialization_format='cdr',
     ))
 
+    map_matcher  = None
+    map_geojson  = None
+    if args.map_graph:
+        print(f'Loading map graph: {args.map_graph}')
+        map_matcher = MapMatcher(args.map_graph)
+        writer.create_topic(rosbag2_py.TopicMetadata(
+            name=EGO_MATCHED_FIX_TOPIC,
+            type='sensor_msgs/msg/NavSatFix',
+            serialization_format='cdr',
+        ))
+        writer.create_topic(rosbag2_py.TopicMetadata(
+            name=EGO_LANE_INFO_TOPIC,
+            type='std_msgs/msg/String',
+            serialization_format='cdr',
+        ))
+        # GeoJSON road overlay — same directory as the graph pickle
+        geojson_path = Path(args.map_graph).parent / 'map.geojson'
+        if geojson_path.exists():
+            map_geojson = GeoJSON()
+            map_geojson.geojson = geojson_path.read_text()
+            writer.create_topic(rosbag2_py.TopicMetadata(
+                name=MAP_ROADS_TOPIC,
+                type='foxglove_msgs/msg/GeoJSON',
+                serialization_format='cdr',
+            ))
+            print(f'Road GeoJSON loaded: {geojson_path}')
+        else:
+            print(f'Warning: {geojson_path} not found — road overlay disabled.')
+        print('Map matching enabled.')
+
     tracker     = LaneTracker(alpha=0.25)
     ego_est     = EgoStateEstimator()
     speed_ms    = 0.0
     frame_count = 0
     total       = 0
 
+    geojson_written = False
     while reader.has_next():
         topic, data, timestamp = reader.read_next()
+
+        # Write static road GeoJSON once at the first message timestamp
+        if not geojson_written and map_geojson is not None:
+            writer.write(MAP_ROADS_TOPIC, serialize_message(map_geojson), timestamp)
+            geojson_written = True
 
         if topic == VEL_TOPIC:
             msg = deserialize_message(data, get_message(type_map[topic]))
@@ -483,6 +626,18 @@ def main():
             odom, imu = ego_est.update(msg, timestamp)
             writer.write(EGO_ODOM_TOPIC, serialize_message(odom), timestamp)
             writer.write(EGO_IMU_TOPIC,  serialize_message(imu),  timestamp)
+
+        elif topic == GPS_TOPIC:
+            writer.write(topic, data, timestamp)
+            if map_matcher is not None:
+                gps_msg = deserialize_message(data, get_message(type_map[topic]))
+                if gps_msg.status.status >= 0:
+                    matched_fix, lane_info = map_matcher.match(
+                        gps_msg.latitude, gps_msg.longitude, timestamp)
+                    writer.write(EGO_MATCHED_FIX_TOPIC,
+                                 serialize_message(matched_fix), timestamp)
+                    writer.write(EGO_LANE_INFO_TOPIC,
+                                 serialize_message(lane_info), timestamp)
 
         elif topic == RAW_TOPIC:
             # rotate raw image and write to same topic
