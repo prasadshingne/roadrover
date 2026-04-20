@@ -20,15 +20,19 @@ import pickle
 import warnings
 from pathlib import Path
 
+import json
+
 import cv2
 import numpy as np
 import rosbag2_py
+from geometry_msgs.msg import Point, PoseStamped, TransformStamped
+from tf2_msgs.msg import TFMessage
+from nav_msgs.msg import Odometry
 from rclpy.serialization import deserialize_message, serialize_message
 from rosidl_runtime_py.utilities import get_message
-from foxglove_msgs.msg import GeoJSON
-from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CompressedImage, Image, Imu, NavSatFix
 from std_msgs.msg import Header, String
+from visualization_msgs.msg import Marker, MarkerArray
 
 COMPRESSED_TOPIC = '/usb_cam/image_raw/compressed'
 RAW_TOPIC        = '/usb_cam/image_raw'
@@ -39,7 +43,9 @@ EGO_ODOM_TOPIC        = '/ego/odometry'
 EGO_IMU_TOPIC         = '/ego/imu'
 EGO_MATCHED_FIX_TOPIC = '/ego/matched_fix'
 EGO_LANE_INFO_TOPIC   = '/ego/lane_info'
-MAP_ROADS_TOPIC       = '/map/roads'
+MAP_LANES_TOPIC       = '/map/lanes'
+EGO_MARKER_TOPIC      = '/ego/marker'
+EGO_POSE_TOPIC        = '/ego/pose'
 
 
 # ── Image rotation helpers ────────────────────────────────────────────────────
@@ -84,6 +90,10 @@ class MapMatcher:
         with open(graph_path, 'rb') as f:
             self._G = pickle.load(f)
         self._ox = ox
+        lats = [d['y'] for _, d in self._G.nodes(data=True)]
+        lons = [d['x'] for _, d in self._G.nodes(data=True)]
+        self.lat0 = float(np.mean(lats))
+        self.lon0 = float(np.mean(lons))
 
     def match(self, lat: float, lon: float, timestamp_ns: int):
         """
@@ -499,6 +509,104 @@ def draw_speed(img: np.ndarray, speed_ms: float) -> None:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1, cv2.LINE_AA)
 
 
+# ── Lane marker helpers ───────────────────────────────────────────────────────
+
+_BOUNDARY_COLORS = {
+    'center': (1.0, 1.0, 0.0),   # yellow  — road centreline
+    'lane':   (0.5, 0.5, 1.0),   # blue    — interior lane boundary
+    'edge':   (1.0, 1.0, 1.0),   # white   — road outer edge
+}
+
+
+def lanes_geojson_to_markers(geojson_path: str, lat0: float, lon0: float) -> MarkerArray:
+    """Convert lane boundary GeoJSON (from make_map.py) to a MarkerArray in ENU frame."""
+    with open(geojson_path) as f:
+        fc = json.load(f)
+
+    ma = MarkerArray()
+    cos_lat = math.cos(math.radians(lat0))
+
+    for idx, feature in enumerate(fc.get('features', [])):
+        geom = feature.get('geometry', {})
+        if geom.get('type') != 'LineString':
+            continue
+        coords = geom['coordinates']   # [[lon, lat], ...]
+        if len(coords) < 2:
+            continue
+        props = feature.get('properties', {})
+        btype = props.get('boundary', 'lane')
+        r, g, b = _BOUNDARY_COLORS.get(btype, (0.6, 0.6, 0.6))
+
+        m = Marker()
+        m.header.frame_id = 'map'
+        m.ns    = 'lanes'
+        m.id    = idx
+        m.type  = Marker.LINE_STRIP
+        m.action = Marker.ADD
+        m.scale.x = 0.15          # line width in metres
+        m.color.r = r
+        m.color.g = g
+        m.color.b = b
+        m.color.a = 0.8
+        m.pose.orientation.w = 1.0
+
+        for lon, lat in coords:
+            p = Point()
+            p.x = (lon - lon0) * cos_lat * 111_320.0
+            p.y = (lat - lat0) * 111_320.0
+            p.z = 0.0
+            m.points.append(p)
+
+        ma.markers.append(m)
+
+    return ma
+
+
+def make_ego_marker(x: float, y: float, heading: float,
+                    timestamp_ns: int) -> Marker:
+    """Arrow marker in ENU 'map' frame representing the ego vehicle position."""
+    m = Marker()
+    m.header.frame_id      = 'map'
+    m.header.stamp.sec     = int(timestamp_ns // 1_000_000_000)
+    m.header.stamp.nanosec = int(timestamp_ns %  1_000_000_000)
+    m.ns    = 'ego'
+    m.id    = 0
+    m.type  = Marker.ARROW
+    m.action = Marker.ADD
+    m.scale.x = 12.0  # arrow length (m)
+    m.scale.y = 4.0   # arrow width  (m)
+    m.scale.z = 2.0
+    m.color.r = 0.0
+    m.color.g = 1.0
+    m.color.b = 0.4
+    m.color.a = 1.0
+    half = heading / 2.0
+    m.pose.position.x    = x
+    m.pose.position.y    = y
+    m.pose.position.z    = 0.0
+    m.pose.orientation.x = 0.0
+    m.pose.orientation.y = 0.0
+    m.pose.orientation.z = math.sin(half)
+    m.pose.orientation.w = math.cos(half)
+    return m
+
+
+def make_ego_pose(x: float, y: float, heading: float,
+                  timestamp_ns: int) -> PoseStamped:
+    """PoseStamped in ENU 'map' frame — used by Foxglove Follow topic."""
+    ps = PoseStamped()
+    ps.header.frame_id      = 'map'
+    ps.header.stamp.sec     = int(timestamp_ns // 1_000_000_000)
+    ps.header.stamp.nanosec = int(timestamp_ns %  1_000_000_000)
+    half = heading / 2.0
+    ps.pose.position.x    = x
+    ps.pose.position.y    = y
+    ps.pose.position.z    = 0.0
+    ps.pose.orientation.z = math.sin(half)
+    ps.pose.orientation.w = math.cos(half)
+    return ps
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def make_compressed_msg(img: np.ndarray, header) -> CompressedImage:
@@ -573,8 +681,8 @@ def main():
         serialization_format='cdr',
     ))
 
-    map_matcher  = None
-    map_geojson  = None
+    map_matcher   = None
+    lane_markers  = None
     if args.map_graph:
         print(f'Loading map graph: {args.map_graph}')
         map_matcher = MapMatcher(args.map_graph)
@@ -588,19 +696,38 @@ def main():
             type='std_msgs/msg/String',
             serialization_format='cdr',
         ))
-        # GeoJSON road overlay — same directory as the graph pickle
-        geojson_path = Path(args.map_graph).parent / 'map.geojson'
+        writer.create_topic(rosbag2_py.TopicMetadata(
+            name=EGO_MARKER_TOPIC,
+            type='visualization_msgs/msg/Marker',
+            serialization_format='cdr',
+        ))
+        writer.create_topic(rosbag2_py.TopicMetadata(
+            name=EGO_POSE_TOPIC,
+            type='geometry_msgs/msg/PoseStamped',
+            serialization_format='cdr',
+        ))
+        writer.create_topic(rosbag2_py.TopicMetadata(
+            name='/tf',
+            type='tf2_msgs/msg/TFMessage',
+            serialization_format='cdr',
+        ))
+        # Lane boundary markers — prefer lanes.geojson, fall back to map.geojson
+        base = Path(args.map_graph).parent
+        geojson_path = base / 'lanes.geojson'
+        if not geojson_path.exists():
+            geojson_path = base / 'map.geojson'
         if geojson_path.exists():
-            map_geojson = GeoJSON()
-            map_geojson.geojson = geojson_path.read_text()
+            lane_markers = lanes_geojson_to_markers(
+                str(geojson_path), map_matcher.lat0, map_matcher.lon0)
             writer.create_topic(rosbag2_py.TopicMetadata(
-                name=MAP_ROADS_TOPIC,
-                type='foxglove_msgs/msg/GeoJSON',
+                name=MAP_LANES_TOPIC,
+                type='visualization_msgs/msg/MarkerArray',
                 serialization_format='cdr',
             ))
-            print(f'Road GeoJSON loaded: {geojson_path}')
+            print(f'Lane markers built: {len(lane_markers.markers)} segments '
+                  f'from {geojson_path}')
         else:
-            print(f'Warning: {geojson_path} not found — road overlay disabled.')
+            print(f'Warning: {geojson_path} not found — lane overlay disabled.')
         print('Map matching enabled.')
 
     tracker     = LaneTracker(alpha=0.25)
@@ -608,20 +735,17 @@ def main():
     speed_ms    = 0.0
     frame_count = 0
     total       = 0
+    ego_heading = 0.0   # tracks latest heading for ego marker
 
-    geojson_written = False
     while reader.has_next():
         topic, data, timestamp = reader.read_next()
-
-        # Write static road GeoJSON once at the first message timestamp
-        if not geojson_written and map_geojson is not None:
-            writer.write(MAP_ROADS_TOPIC, serialize_message(map_geojson), timestamp)
-            geojson_written = True
 
         if topic == VEL_TOPIC:
             msg = deserialize_message(data, get_message(type_map[topic]))
             speed_ms = math.sqrt(
                 msg.twist.linear.x ** 2 + msg.twist.linear.y ** 2)
+            if speed_ms >= EgoStateEstimator._MIN_SPEED:
+                ego_heading = math.atan2(msg.twist.linear.y, msg.twist.linear.x)
             writer.write(topic, data, timestamp)
             odom, imu = ego_est.update(msg, timestamp)
             writer.write(EGO_ODOM_TOPIC, serialize_message(odom), timestamp)
@@ -638,6 +762,40 @@ def main():
                                  serialize_message(matched_fix), timestamp)
                     writer.write(EGO_LANE_INFO_TOPIC,
                                  serialize_message(lane_info), timestamp)
+                    # Ego arrow in ENU 'map' frame
+                    cos_lat = math.cos(math.radians(map_matcher.lat0))
+                    ex = (gps_msg.longitude - map_matcher.lon0) * cos_lat * 111_320.0
+                    ey = (gps_msg.latitude  - map_matcher.lat0) * 111_320.0
+                    ego_m = make_ego_marker(ex, ey, ego_heading, timestamp)
+                    writer.write(EGO_MARKER_TOPIC,
+                                 serialize_message(ego_m), timestamp)
+                    ego_ps = make_ego_pose(ex, ey, ego_heading, timestamp)
+                    writer.write(EGO_POSE_TOPIC,
+                                 serialize_message(ego_ps), timestamp)
+                    # TF: map → base_link so Foxglove can follow base_link
+                    ts = TransformStamped()
+                    ts.header.frame_id      = 'map'
+                    ts.header.stamp.sec     = int(timestamp // 1_000_000_000)
+                    ts.header.stamp.nanosec = int(timestamp %  1_000_000_000)
+                    ts.child_frame_id       = 'base_link'
+                    ts.transform.translation.x = ex
+                    ts.transform.translation.y = ey
+                    ts.transform.translation.z = 0.0
+                    half = ego_heading / 2.0
+                    ts.transform.rotation.z = math.sin(half)
+                    ts.transform.rotation.w = math.cos(half)
+                    tf_msg = TFMessage(transforms=[ts])
+                    writer.write('/tf', serialize_message(tf_msg), timestamp)
+                    # Re-stamp and re-publish lane MarkerArray so Foxglove sees it live
+                    if lane_markers is not None:
+                        h_stamp = Header()
+                        h_stamp.frame_id      = 'map'
+                        h_stamp.stamp.sec     = int(timestamp // 1_000_000_000)
+                        h_stamp.stamp.nanosec = int(timestamp %  1_000_000_000)
+                        for lm in lane_markers.markers:
+                            lm.header = h_stamp
+                        writer.write(MAP_LANES_TOPIC,
+                                     serialize_message(lane_markers), timestamp)
 
         elif topic == RAW_TOPIC:
             # rotate raw image and write to same topic
