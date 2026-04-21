@@ -614,9 +614,8 @@ def draw_speed(img: np.ndarray, speed_ms: float) -> None:
 # ── Lane marker helpers ───────────────────────────────────────────────────────
 
 _BOUNDARY_COLORS = {
-    'center': (1.0, 1.0, 0.0),   # yellow  — road centreline
-    'lane':   (0.5, 0.5, 1.0),   # blue    — interior lane boundary
-    'edge':   (1.0, 1.0, 1.0),   # white   — road outer edge
+    'lane': (0.2, 0.8, 1.0),   # bright cyan  — interior lane boundary
+    'edge': (1.0, 1.0, 1.0),   # white        — road outer edge
 }
 
 
@@ -637,6 +636,8 @@ def lanes_geojson_to_markers(geojson_path: str, lat0: float, lon0: float) -> Mar
             continue
         props = feature.get('properties', {})
         btype = props.get('boundary', 'lane')
+        if btype == 'center':
+            continue   # skip OSM centrelines — edge/lane boundaries already frame the road
         r, g, b = _BOUNDARY_COLORS.get(btype, (0.6, 0.6, 0.6))
 
         m = Marker()
@@ -645,11 +646,11 @@ def lanes_geojson_to_markers(geojson_path: str, lat0: float, lon0: float) -> Mar
         m.id    = idx
         m.type  = Marker.LINE_STRIP
         m.action = Marker.ADD
-        m.scale.x = 0.15          # line width in metres
+        m.scale.x = 0.5           # line width in metres
         m.color.r = r
         m.color.g = g
         m.color.b = b
-        m.color.a = 0.8
+        m.color.a = 0.9
         m.pose.orientation.w = 1.0
 
         for lon, lat in coords:
@@ -666,26 +667,26 @@ def lanes_geojson_to_markers(geojson_path: str, lat0: float, lon0: float) -> Mar
 
 def make_ego_marker(x: float, y: float, heading: float,
                     timestamp_ns: int) -> Marker:
-    """Arrow marker in ENU 'map' frame representing the ego vehicle position."""
+    """Car-box marker in ENU 'map' frame representing the ego vehicle."""
     m = Marker()
     m.header.frame_id      = 'map'
     m.header.stamp.sec     = int(timestamp_ns // 1_000_000_000)
     m.header.stamp.nanosec = int(timestamp_ns %  1_000_000_000)
     m.ns    = 'ego'
     m.id    = 0
-    m.type  = Marker.ARROW
+    m.type  = Marker.CUBE
     m.action = Marker.ADD
-    m.scale.x = 12.0  # arrow length (m)
-    m.scale.y = 4.0   # arrow width  (m)
-    m.scale.z = 2.0
+    m.scale.x = 4.5   # car length (m)
+    m.scale.y = 2.0   # car width  (m)
+    m.scale.z = 1.5   # car height (m)
     m.color.r = 0.0
     m.color.g = 1.0
     m.color.b = 0.4
-    m.color.a = 1.0
+    m.color.a = 0.9
     half = heading / 2.0
     m.pose.position.x    = x
     m.pose.position.y    = y
-    m.pose.position.z    = 0.0
+    m.pose.position.z    = 0.75   # half height so base sits on road plane
     m.pose.orientation.x = 0.0
     m.pose.orientation.y = 0.0
     m.pose.orientation.z = math.sin(half)
