@@ -81,9 +81,8 @@ class MapMatcher:
     """
     Matches GPS fixes to the nearest OSM road edge and estimates lane number.
     Uses an osmnx graph pickled by make_map.py.
-    Lane estimation assumes right-hand traffic, ~3.5 m lane width.
+    Lane estimation assumes right-hand traffic; uses module-level LANE_WIDTH.
     """
-    LANE_WIDTH = 3.5   # metres
 
     def __init__(self, graph_path: str):
         import osmnx as ox
@@ -94,10 +93,19 @@ class MapMatcher:
         lons = [d['x'] for _, d in self._G.nodes(data=True)]
         self.lat0 = float(np.mean(lats))
         self.lon0 = float(np.mean(lons))
+        self._lane_ema           = 1.0   # EMA of continuous lane index; init = rightmost (1)
+        self._lane_alpha         = 0.10  # EMA weight for new estimates (slow)
+        self._lane_num           = 1     # confirmed lane (hysteresis-filtered)
+        self._lane_change_count  = 0     # consecutive fixes proposing a lane change
+        self._LANE_CHANGE_THRESH = 4     # fixes needed to confirm a lane change
 
-    def match(self, lat: float, lon: float, timestamp_ns: int):
+    def match(self, lat: float, lon: float, timestamp_ns: int,
+              bev_d_left_m: float = None, ego_heading: float = 0.0):
         """
-        Returns (matched_NavSatFix, lane_info_String) for the given GPS position.
+        Returns (matched_NavSatFix, lane_info_String, (enu_x, enu_y)).
+        bev_d_left_m: ego's distance in metres from the detected left lane boundary
+                      (from LaneTracker.bev_lateral()); used to refine lane number.
+        ego_heading:  ENU yaw (rad) from /vel; used to resolve edge-direction ambiguity.
         """
         ox = self._ox
         G  = self._G
@@ -140,6 +148,16 @@ class MapMatcher:
             lateral_m    *= 1.0 if cross >= 0 else -1.0
 
             snap_lat, snap_lon = nearest_pt.y, nearest_pt.x
+
+            # If the OSM edge opposes ego heading, flip tangent and lateral sign.
+            # This handles opposite-direction carriageways being snapped as nearest.
+            cos_lat_h = math.cos(math.radians(lat))
+            tang_enu_x = tx * cos_lat_h * 111_320.0
+            tang_enu_y = ty * 111_320.0
+            dot = tang_enu_x * math.cos(ego_heading) + tang_enu_y * math.sin(ego_heading)
+            if dot < 0:
+                tx, ty     = -tx, -ty          # flip tangent so perp is also correct
+                lateral_m  = -lateral_m
         else:
             # Edge has no geometry: use node positions as snap point
             node_data  = G.nodes[u]
@@ -154,10 +172,70 @@ class MapMatcher:
                               else lanes_raw)
         except (ValueError, TypeError):
             total_lanes = 2
-        # Right-hand traffic: lane 1 is rightmost (most negative lateral offset)
-        # Road centerline sits at total_lanes/2 * LANE_WIDTH to the left of lane 1
-        lane_offset = total_lanes / 2.0 * self.LANE_WIDTH + lateral_m
-        lane_num    = max(1, min(total_lanes, int(lane_offset / self.LANE_WIDTH) + 1))
+
+        if (bev_d_left_m is not None
+                and -LANE_WIDTH < bev_d_left_m < 2.0 * LANE_WIDTH):
+            # i_float counts lane boundaries from the nearest OSM edge:
+            #   i≈1 → rightmost lane (closest to edge), i≈N → leftmost lane.
+            # The +N/2 offset used by the road-centre convention is intentionally
+            # omitted: for divided motorways the OSM edge often lies near the road
+            # shoulder, not the centreline, so counting from the edge directly is
+            # more accurate.
+            i_float = (lateral_m + bev_d_left_m) / LANE_WIDTH
+            method  = 'bev'
+        else:
+            i_float = lateral_m / LANE_WIDTH
+            method  = 'gps'
+
+        # EMA smoothing + hysteresis:
+        #   - initialised at lane 1 (rightmost) to match typical highway driving
+        #   - slow alpha damps GPS/BEV noise
+        #   - hysteresis counter prevents transient jumps (lane merges, GPS glitches)
+        self._lane_ema  = min(self._lane_ema, float(total_lanes))  # clamp on merge
+        i_clamped       = max(1.0, min(float(total_lanes), i_float))
+        self._lane_ema  = self._lane_alpha * i_clamped + (1.0 - self._lane_alpha) * self._lane_ema
+        candidate       = max(1, min(total_lanes, round(self._lane_ema)))
+        if candidate != self._lane_num:
+            self._lane_change_count += 1
+            if self._lane_change_count >= self._LANE_CHANGE_THRESH:
+                self._lane_num = candidate
+                self._lane_change_count = 0
+        else:
+            self._lane_change_count = 0
+        # If lane_num shrank due to merge, force valid
+        self._lane_num = max(1, min(total_lanes, self._lane_num))
+        lane_num = self._lane_num
+
+        # ── Lane-centre ENU position ─────────────────────────────────────────
+        # Shift the road snap point laterally to the centre of the matched lane.
+        # lateral_m_center: signed offset from road centreline to lane centre
+        #   positive = left of travel direction, negative = right
+        lateral_m_center = (lane_num - 0.5) * LANE_WIDTH - total_lanes / 2.0 * LANE_WIDTH
+
+        cos_lat0 = math.cos(math.radians(self.lat0))
+        snap_x   = (snap_lon - self.lon0) * cos_lat0 * 111_320.0
+        snap_y   = (snap_lat - self.lat0) * 111_320.0
+
+        if geom is not None:
+            # Road tangent in ENU metres, normalised
+            tang_x   = tx * cos_lat0 * 111_320.0
+            tang_y   = ty * 111_320.0
+            tang_len = math.sqrt(tang_x ** 2 + tang_y ** 2)
+            if tang_len > 1e-9:
+                tang_x /= tang_len
+                tang_y /= tang_len
+            # Perpendicular left of travel: rotate tangent 90° CCW
+            perp_x = -tang_y
+            perp_y =  tang_x
+        else:
+            perp_x, perp_y = 0.0, 1.0   # fallback: north
+
+        lane_enu_x = snap_x + lateral_m_center * perp_x
+        lane_enu_y = snap_y + lateral_m_center * perp_y
+
+        # Convert lane centre back to lat/lon for the NavSatFix
+        lane_lat = lane_enu_y / 111_320.0 + self.lat0
+        lane_lon = lane_enu_x / (cos_lat0 * 111_320.0) + self.lon0
 
         # ── Build ROS messages ──────────────────────────────────────────────
         h = Header()
@@ -167,16 +245,18 @@ class MapMatcher:
 
         fix               = NavSatFix()
         fix.header        = h
-        fix.latitude      = snap_lat
-        fix.longitude     = snap_lon
+        fix.latitude      = lane_lat
+        fix.longitude     = lane_lon
         fix.altitude      = 0.0
         fix.status.status = 0   # STATUS_FIX
 
+        bev_str   = (f' | bev_d_left {bev_d_left_m:.2f} m'
+                     if bev_d_left_m is not None else '')
         info      = String()
-        info.data = (f'{name} | lane {lane_num}/{total_lanes} | '
-                     f'offset {lateral_m:+.1f} m')
+        info.data = (f'{name} | lane {lane_num}/{total_lanes} [{method}] | '
+                     f'gps_offset {lateral_m:+.1f} m{bev_str}')
 
-        return fix, info
+        return fix, info, (lane_enu_x, lane_enu_y)
 
 
 # ── Ego state estimation ──────────────────────────────────────────────────────
@@ -272,6 +352,7 @@ class EgoStateEstimator:
 # ── Lane detection ────────────────────────────────────────────────────────────
 
 HOOD_CUTOFF = 0.63   # below this fraction of height = car hood
+LANE_WIDTH  = 3.5    # metres, standard lane width (used for BEV scale and map matching)
 
 # Bird's-eye view (BEV / IPM) constants
 BEV_W          = 400
@@ -361,6 +442,27 @@ class LaneTracker:
         if side == 'right' and not (BEV_W * 0.45 <= x_base <= BEV_W - BEV_MARGIN * 0.5):
             return None
         return poly
+
+    def bev_lateral(self):
+        """
+        Returns (d_left_m, valid).
+        d_left_m: ego's distance in metres from the detected left lane boundary,
+                  computed from the BEV polynomial at y=BEV_H (closest to car).
+                  Self-calibrating: uses detected lane width to set the m/px scale.
+        valid: False when either polynomial is missing or detected width is implausible.
+        """
+        if self.left_poly is None or self.right_poly is None:
+            return 0.0, False
+        left_x  = float(np.polyval(self.left_poly,  BEV_H))
+        right_x = float(np.polyval(self.right_poly, BEV_H))
+        ego_x   = BEV_W / 2.0
+        lane_px = right_x - left_x
+        # Sanity: detected lane width must be 10–70% of BEV canvas width
+        if not (BEV_W * 0.10 <= lane_px <= BEV_W * 0.70):
+            return 0.0, False
+        scale  = LANE_WIDTH / lane_px   # metres per BEV pixel (self-calibrating)
+        d_left = (ego_x - left_x) * scale
+        return float(d_left), True
 
 
 def _bev_sliding_window(bev_binary: np.ndarray, tracker: LaneTracker,
@@ -735,7 +837,11 @@ def main():
     speed_ms    = 0.0
     frame_count = 0
     total       = 0
-    ego_heading = 0.0   # tracks latest heading for ego marker
+    ego_heading    = 0.0   # tracks latest heading for ego marker (from /vel)
+    gps_heading    = None  # heading from consecutive GPS positions (fallback)
+    prev_gps_lat   = None
+    prev_gps_lon   = None
+    bev_d_left     = None  # metres from detected left lane boundary (updated per frame)
 
     while reader.has_next():
         topic, data, timestamp = reader.read_next()
@@ -756,30 +862,41 @@ def main():
             if map_matcher is not None:
                 gps_msg = deserialize_message(data, get_message(type_map[topic]))
                 if gps_msg.status.status >= 0:
-                    matched_fix, lane_info = map_matcher.match(
-                        gps_msg.latitude, gps_msg.longitude, timestamp)
+                    # GPS-track heading from consecutive fixes (robust fallback)
+                    if prev_gps_lat is not None:
+                        dlat = gps_msg.latitude  - prev_gps_lat
+                        dlon = gps_msg.longitude - prev_gps_lon
+                        if abs(dlat) + abs(dlon) > 1e-6:
+                            gps_heading = math.atan2(
+                                dlat,
+                                dlon * math.cos(math.radians(gps_msg.latitude)))
+                    prev_gps_lat = gps_msg.latitude
+                    prev_gps_lon = gps_msg.longitude
+                    heading_for_match = (gps_heading if gps_heading is not None
+                                         else ego_heading)
+                    matched_fix, lane_info, (lx, ly) = map_matcher.match(
+                        gps_msg.latitude, gps_msg.longitude, timestamp,
+                        bev_d_left_m=bev_d_left,
+                        ego_heading=heading_for_match)
                     writer.write(EGO_MATCHED_FIX_TOPIC,
                                  serialize_message(matched_fix), timestamp)
                     writer.write(EGO_LANE_INFO_TOPIC,
                                  serialize_message(lane_info), timestamp)
-                    # Ego arrow in ENU 'map' frame
-                    cos_lat = math.cos(math.radians(map_matcher.lat0))
-                    ex = (gps_msg.longitude - map_matcher.lon0) * cos_lat * 111_320.0
-                    ey = (gps_msg.latitude  - map_matcher.lat0) * 111_320.0
-                    ego_m = make_ego_marker(ex, ey, ego_heading, timestamp)
+                    # Ego arrow + pose snapped to lane centre in ENU 'map' frame
+                    ego_m = make_ego_marker(lx, ly, ego_heading, timestamp)
                     writer.write(EGO_MARKER_TOPIC,
                                  serialize_message(ego_m), timestamp)
-                    ego_ps = make_ego_pose(ex, ey, ego_heading, timestamp)
+                    ego_ps = make_ego_pose(lx, ly, ego_heading, timestamp)
                     writer.write(EGO_POSE_TOPIC,
                                  serialize_message(ego_ps), timestamp)
-                    # TF: map → base_link so Foxglove can follow base_link
+                    # TF: map → base_link at lane centre
                     ts = TransformStamped()
                     ts.header.frame_id      = 'map'
                     ts.header.stamp.sec     = int(timestamp // 1_000_000_000)
                     ts.header.stamp.nanosec = int(timestamp %  1_000_000_000)
                     ts.child_frame_id       = 'base_link'
-                    ts.transform.translation.x = ex
-                    ts.transform.translation.y = ey
+                    ts.transform.translation.x = lx
+                    ts.transform.translation.y = ly
                     ts.transform.translation.z = 0.0
                     half = ego_heading / 2.0
                     ts.transform.rotation.z = math.sin(half)
@@ -823,6 +940,8 @@ def main():
                     det_results.boxes = det_results.boxes[keep]
 
                 lane_overlay = detect_lanes(img, tracker, det_results.boxes)
+                d, bev_ok = tracker.bev_lateral()
+                bev_d_left = d if bev_ok else None
 
                 # compose: YOLO boxes on clean frame, then blend lane overlay
                 annotated = det_results.plot()

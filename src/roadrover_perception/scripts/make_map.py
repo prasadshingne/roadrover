@@ -156,21 +156,32 @@ def generate_lane_geojson(G, lat0, lon0, out_path):
             except Exception:
                 return []
 
-        # Right-side boundaries (negative offset in shapely = right of direction)
-        for i in range(r_lanes + 1):
-            btype = 'center' if i == 0 else ('edge' if i == r_lanes else 'lane')
-            if i == 0:
-                coords_ll = [_enu_to_lonlat(x, y, lat0, lon0) for x, y in enu_line.coords]
-                features.append(_line_feature(coords_ll, name, hw, btype))
-            else:
+        # Always draw the OSM centreline for reference
+        coords_ll = [_enu_to_lonlat(x, y, lat0, lon0) for x, y in enu_line.coords]
+        features.append(_line_feature(coords_ll, name, hw, 'center'))
+
+        # For one-way roads the OSM edge runs through the physical road centre,
+        # so lanes must be drawn symmetrically around it (half-width to each side).
+        # For bidirectional roads the OSM edge is the centre divider; right-side
+        # lanes go right (-) and left-side lanes go left (+).
+        if l_lanes == 0:
+            # One-way: centre the n lanes on the OSM edge
+            r_base = r_lanes / 2.0 * LANE_WIDTH   # left road edge offset
+            for i in range(r_lanes + 1):
+                offset = r_base - i * LANE_WIDTH
+                btype  = 'edge' if (i == 0 or i == r_lanes) else 'lane'
+                for coords_ll in offset_to_lonlat(enu_line, offset):
+                    features.append(_line_feature(coords_ll, name, hw, btype))
+        else:
+            # Bidirectional: right lanes go right, left lanes go left
+            for i in range(1, r_lanes + 1):
+                btype = 'edge' if i == r_lanes else 'lane'
                 for coords_ll in offset_to_lonlat(enu_line, -i * LANE_WIDTH):
                     features.append(_line_feature(coords_ll, name, hw, btype))
-
-        # Left-side boundaries
-        for i in range(1, l_lanes + 1):
-            btype = 'edge' if i == l_lanes else 'lane'
-            for coords_ll in offset_to_lonlat(enu_line, i * LANE_WIDTH):
-                features.append(_line_feature(coords_ll, name, hw, btype))
+            for i in range(1, l_lanes + 1):
+                btype = 'edge' if i == l_lanes else 'lane'
+                for coords_ll in offset_to_lonlat(enu_line, i * LANE_WIDTH):
+                    features.append(_line_feature(coords_ll, name, hw, btype))
 
     geojson = {'type': 'FeatureCollection', 'features': features}
     with open(out_path, 'w') as f:
