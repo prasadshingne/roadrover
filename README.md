@@ -126,6 +126,7 @@ python3 src/roadrover_perception/scripts/process_bag.py <bag> --output <out_bag>
 | Object detection | YOLOv8s on GPU; detections in the car hood region are filtered out |
 | Lane detection | Bird's-eye view (BEV) perspective warp + sliding window search; EMA-smoothed degree-2 polynomial per lane |
 | Ego state estimation | Heading, yaw rate, longitudinal and lateral acceleration derived from GPS velocity |
+| Map matching | GPS fix snapped to nearest OSM road edge; lane number estimated from GPS lateral offset + BEV measurement |
 
 ### Output topics
 
@@ -134,6 +135,12 @@ python3 src/roadrover_perception/scripts/process_bag.py <bag> --output <out_bag>
 | `/perception/image_annotated` | `CompressedImage` | YOLO boxes + lane overlay + speed |
 | `/ego/odometry` | `nav_msgs/Odometry` | Heading (quaternion), speed, yaw rate |
 | `/ego/imu` | `sensor_msgs/Imu` | Yaw rate, longitudinal accel, lateral accel |
+| `/ego/matched_fix` | `NavSatFix` | GPS snapped to estimated lane centre |
+| `/ego/lane_info` | `String` | Road name, lane number, method, GPS offset, BEV offset |
+| `/ego/marker` | `Marker` (CUBE) | Car-box in ENU `map` frame, yaws with heading |
+| `/ego/pose` | `PoseStamped` | Ego pose in `map` frame |
+| `/map/lanes` | `MarkerArray` | Lane boundary LINE_STRIP markers in ENU `map` frame |
+| `/tf` | `TFMessage` | `map → base_link` transform per GPS fix |
 
 ### Ego state signals
 
@@ -146,6 +153,23 @@ All signals are derived from the GPS `/vel` topic (no IMU on this rover):
 | Longitudinal accel | Speed | `d(speed)/dt` + EMA |
 | Lateral accel | Speed + yaw rate | `speed × yaw_rate` (centripetal) |
 
+### Map matching and lane localization
+
+Pass `--map-graph` to enable map matching. The graph is produced by `make_map.py` (see [OSM map pipeline](#osm-map-pipeline) below).
+
+```bash
+python3 src/roadrover_perception/scripts/process_bag.py ~/roadrover_bags/session_<timestamp> \
+    --map-graph ~/roadrover_bags/map_graph.pkl
+```
+
+The localization runs in two stages per GPS fix:
+
+1. **GPS snap** — the raw fix is projected onto the nearest OSM road edge to get a signed lateral offset (positive = left of road direction). An edge-direction check (dot product of edge tangent vs ego heading from `/vel`) flips the sign when the nearest edge is the opposing carriageway on a divided highway.
+
+2. **BEV refinement** — after lane detection, the BEV image is used to measure `bev_d_left`: the ego's distance in metres from its detected left lane boundary. The self-calibrating scale is `LANE_WIDTH / lane_width_px`. The estimated left boundary position is `lateral_m + bev_d_left`, which is divided by `LANE_WIDTH` to get a continuous lane index. An EMA (α = 0.10) with a 4-fix hysteresis counter smooths the result and initialises at lane 1 (rightmost) to match typical highway driving.
+
+The `/ego/lane_info` string topic reports `road | lane k/N [method] | gps_offset ±X m | bev_d_left Y m` for every GPS fix.
+
 ### Viewing in Foxglove
 
 ![Ego state plots in Foxglove](docs/Ego_State.png)
@@ -154,6 +178,8 @@ Open the processed bag in Foxglove Studio (File → Open local file). Useful pan
 
 - **Image** panel → `/perception/image_annotated` — annotated video with lanes and YOLO boxes
 - **Map** panel → `/fix` — GPS track on a satellite map
+- **3D** panel → add topics `/map/lanes` (lane boundary markers) and `/ego/marker` (car box); set **Display frame** to `base_link` to follow the ego
+- **Raw messages** panel → `/ego/lane_info` — live road/lane diagnostics
 - **Plot** panel — add series for time-series signals:
 
 | Signal | Topic | Field path |
@@ -162,6 +188,8 @@ Open the processed bag in Foxglove Studio (File → Open local file). Useful pan
 | Yaw rate (rad/s) | `/ego/odometry` | `twist.twist.angular.z` |
 | Longitudinal accel | `/ego/imu` | `linear_acceleration.x` |
 | Lateral accel | `/ego/imu` | `linear_acceleration.y` |
+
+> **Foxglove 3D tip:** the TF visualizer draws a connection line between the `map` origin and `base_link`. To hide it, open the panel settings → **Transforms** → uncheck **Show connection lines**.
 
 ### Lane detection debug tool
 
@@ -184,6 +212,32 @@ Output images in `/tmp/lane_debug/`:
 | `6_bev_windows.jpg` | Sliding windows in BEV |
 | `7_bev_fit.jpg` | Polynomial fit in BEV |
 | `8_lane_overlay.jpg` | Lanes warped back to image space |
+
+## OSM map pipeline
+
+Before running map matching, generate the road network for a recorded session:
+
+```bash
+# 1. Download OSM road network and build lane geometry
+python3 src/roadrover_perception/scripts/make_map.py ~/roadrover_bags/session_<timestamp>
+```
+
+This reads the `/fix` GPS track from the bag, downloads the matching OSM road graph, and writes three files to the bag's parent directory:
+
+| File | Content |
+|------|---------|
+| `map.geojson` | Road centrelines — drag onto Foxglove **Map** panel |
+| `lanes.geojson` | Lane boundary lines — consumed by `process_bag.py` for `/map/lanes` markers |
+| `map_graph.pkl` | Pickled osmnx graph — passed to `process_bag.py` via `--map-graph` |
+
+Lane boundaries are computed per OSM edge: one-way roads get lanes centred on the OSM edge (±half road width); bidirectional roads split lanes left and right of the centreline.
+
+```bash
+# 2. (Optional) Generate OpenDRIVE for simulation
+python3 src/roadrover_perception/scripts/make_xodr.py ~/roadrover_bags/map_graph.pkl
+# → ~/roadrover_bags/map.xodr
+# Verify: esmini --odr map.xodr --window 60 60 1200 800
+```
 
 ## Changing device paths
 
