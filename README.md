@@ -239,6 +239,42 @@ python3 src/roadrover_perception/scripts/make_xodr.py ~/roadrover_bags/map_graph
 # Verify: esmini --odr map.xodr --window 60 60 1200 800
 ```
 
+Each OSM edge is split into per-polyline-segment roads so curves are preserved. For one-way roads the reference line is shifted to the carriageway's left edge so that the outermost (rightmost) lane centre aligns with the ego position written by `process_bag.py`. Bidirectional roads split lanes symmetrically around the OSM centreline.
+
+## Scenario extraction
+
+Extract an OpenSCENARIO 1.x scenario from a processed bag. The ego trajectory comes from `/ego/pose`; actors are detected with YOLOv8s and tracked across frames using IoU matching.
+
+```bash
+python3 src/roadrover_perception/scripts/make_scenario.py \
+    ~/roadrover_bags/session_<timestamp>_processed \
+    --map-graph ~/roadrover_bags/map_graph.pkl \
+    --out-dir ~/roadrover_bags/scenario_out
+```
+
+This writes two files to `--out-dir`:
+
+| File | Content |
+|------|---------|
+| `map.xodr` | OpenDRIVE road network (auto-generated via `make_xodr.py`) |
+| `scenario.xosc` | OpenSCENARIO 1.x file — ego + detected actor trajectories |
+
+The processed bag must have been produced by `process_bag.py --map-graph` (requires `/ego/pose` topic).
+
+**Actor detection pipeline:**
+
+1. Re-run YOLOv8s on `/perception/image_annotated` frames (vehicle classes: car, motorcycle, bus, truck)
+2. Track detections across frames with greedy IoU matching (`IOU_THRESHOLD=0.30`)
+3. Project each bounding-box bottom-centre to ENU via a pinhole road-plane model
+4. Export tracks with ≥ 10 qualifying frames (configurable via `--min-track-frames`)
+
+**Verify in esmini:**
+
+```bash
+cd ~/roadrover_bags/scenario_out
+esmini --osc scenario.xosc --window 60 60 1200 800
+```
+
 ## Changing device paths
 
 If your camera or GPS receiver is on a different device node, edit the parameters in
