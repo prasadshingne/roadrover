@@ -127,19 +127,21 @@ python3 src/roadrover_perception/scripts/process_bag.py <bag> --output <out_bag>
 | Lane detection | Bird's-eye view (BEV) perspective warp + sliding window search; EMA-smoothed degree-2 polynomial per lane |
 | Ego state estimation | Heading, yaw rate, longitudinal and lateral acceleration derived from GPS velocity |
 | Map matching | GPS fix snapped to nearest OSM road edge; lane number estimated from GPS lateral offset + BEV measurement |
+| Actor tracking | IoU tracker on YOLO vehicle detections; 3D box positions projected to ENU via bounding-box-height model |
 
 ### Output topics
 
 | Topic | Type | Content |
 |-------|------|---------|
 | `/perception/image_annotated` | `CompressedImage` | YOLO boxes + lane overlay + speed |
+| `/perception/actors` | `MarkerArray` | Tracked vehicle boxes (orange CUBEs) in ENU `map` frame; requires `--map-graph` |
 | `/ego/odometry` | `nav_msgs/Odometry` | Heading (quaternion), speed, yaw rate |
 | `/ego/imu` | `sensor_msgs/Imu` | Yaw rate, longitudinal accel, lateral accel |
 | `/ego/matched_fix` | `NavSatFix` | GPS snapped to estimated lane centre |
 | `/ego/lane_info` | `String` | Road name, lane number, method, GPS offset, BEV offset |
 | `/ego/marker` | `Marker` (CUBE) | Car-box in ENU `map` frame, yaws with heading |
 | `/ego/pose` | `PoseStamped` | Ego pose in `map` frame |
-| `/map/lanes` | `MarkerArray` | Lane boundary LINE_STRIP markers in ENU `map` frame |
+| `/map/lanes` | `MarkerArray` | Lane boundary LINE_STRIP markers in ENU `map` frame (cyan = interior, white = edge, yellow = centreline) |
 | `/tf` | `TFMessage` | `map → base_link` transform per GPS fix |
 
 ### Ego state signals
@@ -178,7 +180,7 @@ Open the processed bag in Foxglove Studio (File → Open local file). Useful pan
 
 - **Image** panel → `/perception/image_annotated` — annotated video with lanes and YOLO boxes
 - **Map** panel → `/fix` — GPS track on a satellite map
-- **3D** panel → add topics `/map/lanes` (lane boundary markers) and `/ego/marker` (car box); set **Display frame** to `base_link` to follow the ego
+- **3D** panel → add topics `/map/lanes` (lane boundaries), `/ego/marker` (ego car box), and `/perception/actors` (detected vehicle boxes); set **Display frame** to `base_link` to follow the ego
 - **Raw messages** panel → `/ego/lane_info` — live road/lane diagnostics
 - **Plot** panel — add series for time-series signals:
 

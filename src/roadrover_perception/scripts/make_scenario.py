@@ -44,18 +44,16 @@ from rosidl_runtime_py.utilities import get_message
 from sensor_msgs.msg import CompressedImage, NavSatFix
 
 # ── Camera intrinsics (uncalibrated approximation) ────────────────────────────
-F_PX    = 500.0    # focal length in pixels
-CX      = 320.0    # principal point x
-CY      = 240.0    # principal point y
-H_CAM   = 1.2      # camera height above road plane (metres)
-TILT_DEG = 5.0     # camera tilt down from horizontal (degrees)
-V_HORIZON = int(CY - F_PX * math.sin(math.radians(TILT_DEG)))  # ≈ 197
+F_PX          = 500.0    # focal length in pixels
+CX            = 320.0    # principal point x
+VEHICLE_HEIGHT = 1.5     # metres — assumed generic vehicle height for box projection
 
 # ── Tracking parameters ───────────────────────────────────────────────────────
 VEHICLE_CLASSES    = {2, 3, 5, 7}   # car, motorcycle, bus, truck
 IOU_THRESHOLD      = 0.30           # min IoU to continue a track
 MIN_TRACK_FRAMES   = 10             # discard tracks shorter than this
 MAX_TRACK_GAP      = 5              # max missed frames before track is closed
+MAX_PROJ_DIST      = 80.0           # metres — discard projections beyond this (noisy)
 
 # ── Lane / road width (matches process_bag.py) ───────────────────────────────
 LANE_WIDTH = 3.5   # metres
@@ -75,27 +73,26 @@ def quat_to_yaw(qz: float, qw: float) -> float:
     return 2.0 * math.atan2(qz, qw)
 
 
-# ── Road-plane projection ─────────────────────────────────────────────────────
+# ── Box-height projection ─────────────────────────────────────────────────────
 
-def pixel_to_enu(u: float, v: float, ego_x: float, ego_y: float,
-                 ego_heading: float) -> tuple[float, float] | None:
+def box_to_enu(box, ego_x: float, ego_y: float,
+               ego_heading: float) -> tuple[float, float] | None:
     """
-    Project image pixel (u, v) — bounding-box bottom-centre — onto the flat
-    road plane and return its ENU position (x, y) in the map frame.
-
-    Returns None when the pixel is above the horizon (object too far or sky).
+    Project a bounding box to ENU by estimating distance from box height.
+    d_fwd = F_PX * VEHICLE_HEIGHT / box_height_px.
+    Works for any image position — no horizon dependency.
+    Returns None when box is too small or actor is beyond MAX_PROJ_DIST.
     """
-    if v <= V_HORIZON:
+    x1, y1, x2, y2 = box
+    box_h_px = y2 - y1
+    if box_h_px < 5:
         return None
-    dv = v - V_HORIZON          # pixels below horizon
-    if dv < 1.0:
+    d_fwd = F_PX * VEHICLE_HEIGHT / box_h_px
+    if d_fwd > MAX_PROJ_DIST:
         return None
-    d_fwd = F_PX * H_CAM / dv  # forward distance in metres
-    d_lat = (u - CX) * d_fwd / F_PX  # lateral offset (+ = right in image = left of ego)
-    # Rotate from ego-relative to ENU
+    u_c   = (x1 + x2) / 2.0
+    d_lat = (u_c - CX) * d_fwd / F_PX   # positive = right in image
     sin_h, cos_h = math.sin(ego_heading), math.cos(ego_heading)
-    # Ego forward = heading direction; ego left = heading + 90°
-    # d_lat positive in image = object to the right of ego (−left)
     dx = d_fwd * cos_h - d_lat * sin_h
     dy = d_fwd * sin_h + d_lat * cos_h
     return ego_x + dx, ego_y + dy
@@ -159,9 +156,7 @@ class IoUTracker:
             ti, di = np.unravel_index(iou_matrix.argmax(), iou_matrix.shape)
             track = self._active[ti]
             box   = detections[di]
-            u_c   = (box[0] + box[2]) / 2.0
-            v_bot = float(box[3])
-            enu   = pixel_to_enu(u_c, v_bot, ego_x, ego_y, ego_heading)
+            enu   = box_to_enu(box, ego_x, ego_y, ego_heading)
             wp    = (t_s, enu[0], enu[1], ego_heading, 0.0) if enu else None
             track.update(box, frame_idx, wp)
             matched_track_ids.add(ti)
@@ -173,10 +168,8 @@ class IoUTracker:
         for di, det in enumerate(detections):
             if di in matched_det_ids:
                 continue
-            u_c   = (det[0] + det[2]) / 2.0
-            v_bot = float(det[3])
-            enu   = pixel_to_enu(u_c, v_bot, ego_x, ego_y, ego_heading)
-            wp    = (t_s, enu[0], enu[1], ego_heading, 0.0) if enu else None
+            enu = box_to_enu(det, ego_x, ego_y, ego_heading)
+            wp  = (t_s, enu[0], enu[1], ego_heading, 0.0) if enu else None
             self._active.append(Track(det, frame_idx, wp))
 
         # Age unmatched tracks; close stale ones
@@ -223,12 +216,49 @@ def build_xosc(ego_waypoints: list, actor_tracks: list[Track],
                author: str = 'roadrover') -> 'Scenario':
     from scenariogeneration import xosc
 
+    t_scenario_start = ego_waypoints[0][0]
+
     def wp_to_world(wp) -> 'xosc.WorldPosition':
         _t_s, x, y, heading, _speed = wp
         return xosc.WorldPosition(x=x, y=y, h=heading)
 
-    def make_trajectory(name: str, waypoints: list) -> 'xosc.Trajectory':
-        times     = [wp[0] - waypoints[0][0] for wp in waypoints]
+    def smooth_positions(waypoints: list, window: int = 5) -> list:
+        """Replace (x, y) with a centred moving average to remove outlier jumps."""
+        if len(waypoints) < window:
+            return waypoints
+        wps = list(waypoints)
+        xs = np.array([w[1] for w in wps])
+        ys = np.array([w[2] for w in wps])
+        half = window // 2
+        xs_s = np.convolve(xs, np.ones(window) / window, mode='same')
+        ys_s = np.convolve(ys, np.ones(window) / window, mode='same')
+        # edges: keep originals where convolution is padded (first/last half)
+        xs_s[:half]  = xs[:half]
+        xs_s[-half:] = xs[-half:]
+        ys_s[:half]  = ys[:half]
+        ys_s[-half:] = ys[-half:]
+        return [(wps[i][0], float(xs_s[i]), float(ys_s[i]), wps[i][3], wps[i][4])
+                for i in range(len(wps))]
+
+    def with_headings(waypoints: list) -> list:
+        """Return a copy of waypoints with heading derived from motion direction."""
+        wps = list(waypoints)
+        for i in range(len(wps) - 1):
+            t0, x0, y0, h0, s0 = wps[i]
+            _t1, x1, y1, _h1, _s1 = wps[i + 1]
+            dx, dy = x1 - x0, y1 - y0
+            if dx * dx + dy * dy > 0.01:   # >0.1 m movement
+                h0 = math.atan2(dy, dx)
+            wps[i] = (t0, x0, y0, h0, s0)
+        if len(wps) > 1:
+            # last waypoint keeps the heading of the second-to-last
+            t, x, y, _, s = wps[-1]
+            wps[-1] = (t, x, y, wps[-2][3], s)
+        return wps
+
+    def make_trajectory(name: str, waypoints: list, t_start: float) -> 'xosc.Trajectory':
+        # times relative to scenario start so actors move at the right moment
+        times     = [wp[0] - t_start for wp in waypoints]
         positions = [wp_to_world(wp) for wp in waypoints]
         poly      = xosc.Polyline(time=times, positions=positions)
         traj      = xosc.Trajectory(name=name, closed=False)
@@ -318,12 +348,15 @@ def build_xosc(ego_waypoints: list, actor_tracks: list[Track],
         return act
 
     story.add_act(_make_act('EgoAct', 'Ego',
-                            make_trajectory('EgoTrajectory', ego_waypoints)))
+                            make_trajectory('EgoTrajectory', ego_waypoints,
+                                            t_scenario_start)))
     for track in actor_tracks:
         story.add_act(_make_act(
             f'ActorAct_{track.id}',
             f'Actor_{track.id}',
-            make_trajectory(f'ActorTraj_{track.id}', track.waypoints),
+            make_trajectory(f'ActorTraj_{track.id}',
+                            with_headings(smooth_positions(track.waypoints)),
+                            t_scenario_start),
         ))
 
     storyboard = xosc.StoryBoard(init=init, stoptrigger=xosc.EmptyTrigger('stop'))
@@ -449,11 +482,22 @@ def main():
     pose_arr   = np.array(pose_times, dtype=np.int64)
 
     def nearest_ego_state(ts: int):
+        # Linearly interpolate ego pose between the two surrounding GPS fixes
+        # so actor projections don't jump when a new fix arrives (~1 Hz).
         pi = int(np.searchsorted(pose_arr, ts))
-        pi = min(pi, len(pose_times) - 1)
-        if pi > 0 and abs(pose_arr[pi-1] - ts) < abs(pose_arr[pi] - ts):
-            pi -= 1
-        ex, ey, heading = ego_poses[pose_times[pi]]
+        if pi == 0:
+            ex, ey, heading = ego_poses[pose_times[0]]
+        elif pi >= len(pose_times):
+            ex, ey, heading = ego_poses[pose_times[-1]]
+        else:
+            t0, t1 = pose_times[pi - 1], pose_times[pi]
+            alpha = (ts - t0) / (t1 - t0)
+            x0, y0, h0 = ego_poses[t0]
+            x1, y1, h1 = ego_poses[t1]
+            ex = x0 + alpha * (x1 - x0)
+            ey = y0 + alpha * (y1 - y0)
+            dh = math.atan2(math.sin(h1 - h0), math.cos(h1 - h0))
+            heading = h0 + alpha * dh
 
         oi = int(np.searchsorted(odom_arr, ts))
         oi = min(oi, len(odom_arr) - 1)

@@ -46,6 +46,16 @@ EGO_LANE_INFO_TOPIC   = '/ego/lane_info'
 MAP_LANES_TOPIC       = '/map/lanes'
 EGO_MARKER_TOPIC      = '/ego/marker'
 EGO_POSE_TOPIC        = '/ego/pose'
+ACTORS_TOPIC          = '/perception/actors'
+
+# ── Actor detection constants ────────────────────────────────────────────────
+_ACT_F_PX          = 500.0
+_ACT_CX            = 320.0
+_ACT_VEHICLE_H     = 1.5    # assumed vehicle height (metres)
+_ACT_MAX_DIST      = 80.0   # discard projections beyond this (metres)
+_ACT_VEHICLE_CLS   = {2, 3, 5, 7}   # COCO: car, motorcycle, bus, truck
+_ACT_IOU_THRESH    = 0.30
+_ACT_MAX_GAP       = 5
 
 
 # ── Image rotation helpers ────────────────────────────────────────────────────
@@ -614,8 +624,9 @@ def draw_speed(img: np.ndarray, speed_ms: float) -> None:
 # ── Lane marker helpers ───────────────────────────────────────────────────────
 
 _BOUNDARY_COLORS = {
-    'lane': (0.2, 0.8, 1.0),   # bright cyan  — interior lane boundary
-    'edge': (1.0, 1.0, 1.0),   # white        — road outer edge
+    'lane':   (0.2, 0.8, 1.0),   # bright cyan  — interior lane boundary
+    'edge':   (1.0, 1.0, 1.0),   # white        — road outer edge
+    'center': (1.0, 0.9, 0.0),   # yellow       — road centreline / carriageway divider
 }
 
 
@@ -636,8 +647,6 @@ def lanes_geojson_to_markers(geojson_path: str, lat0: float, lon0: float) -> Mar
             continue
         props = feature.get('properties', {})
         btype = props.get('boundary', 'lane')
-        if btype == 'center':
-            continue   # skip OSM centrelines — edge/lane boundaries already frame the road
         r, g, b = _BOUNDARY_COLORS.get(btype, (0.6, 0.6, 0.6))
 
         m = Marker()
@@ -708,6 +717,91 @@ def make_ego_pose(x: float, y: float, heading: float,
     ps.pose.orientation.z = math.sin(half)
     ps.pose.orientation.w = math.cos(half)
     return ps
+
+
+# ── Actor tracking ───────────────────────────────────────────────────────────
+
+def _act_box_to_enu(box, ego_x: float, ego_y: float,
+                    ego_heading: float):
+    x1, y1, x2, y2 = box
+    box_h = y2 - y1
+    if box_h < 5:
+        return None
+    d_fwd = _ACT_F_PX * _ACT_VEHICLE_H / box_h
+    if d_fwd > _ACT_MAX_DIST:
+        return None
+    d_lat = ((x1 + x2) / 2.0 - _ACT_CX) * d_fwd / _ACT_F_PX
+    sh, ch = math.sin(ego_heading), math.cos(ego_heading)
+    return ego_x + d_fwd * ch - d_lat * sh, ego_y + d_fwd * sh + d_lat * ch
+
+
+def _act_iou(a, b) -> float:
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    ua = (a[2]-a[0])*(a[3]-a[1]); ub = (b[2]-b[0])*(b[3]-b[1])
+    union = ua + ub - inter
+    return inter / union if union > 0 else 0.0
+
+
+class _ActorTrack:
+    _next_id = 0
+    def __init__(self, box, enu):
+        self.id  = _ActorTrack._next_id; _ActorTrack._next_id += 1
+        self.box = box; self.enu = enu; self.gap = 0
+
+
+class ActorTracker:
+    def __init__(self):
+        self._active: list[_ActorTrack] = []
+
+    def update(self, boxes, ego_x: float, ego_y: float, ego_heading: float):
+        matched_t: set = set(); matched_d: set = set()
+        iou_m = np.zeros((len(self._active), len(boxes)))
+        for ti, tr in enumerate(self._active):
+            for di, b in enumerate(boxes):
+                iou_m[ti, di] = _act_iou(tr.box, b)
+        while iou_m.size > 0 and iou_m.max() >= _ACT_IOU_THRESH:
+            ti, di = np.unravel_index(iou_m.argmax(), iou_m.shape)
+            self._active[ti].box = boxes[di]
+            self._active[ti].enu = _act_box_to_enu(boxes[di], ego_x, ego_y, ego_heading)
+            self._active[ti].gap = 0
+            matched_t.add(ti); matched_d.add(di)
+            iou_m[ti, :] = 0.0; iou_m[:, di] = 0.0
+        for di, b in enumerate(boxes):
+            if di not in matched_d:
+                self._active.append(_ActorTrack(b, _act_box_to_enu(b, ego_x, ego_y, ego_heading)))
+        still = []
+        for ti, tr in enumerate(self._active):
+            if ti not in matched_t:
+                tr.gap += 1
+            if tr.gap <= _ACT_MAX_GAP:
+                still.append(tr)
+        self._active = still
+
+    def active_markers(self, timestamp_ns: int) -> MarkerArray:
+        ma = MarkerArray()
+        for tr in self._active:
+            if tr.enu is None:
+                continue
+            x, y = tr.enu
+            m = Marker()
+            m.header.frame_id      = 'map'
+            m.header.stamp.sec     = int(timestamp_ns // 1_000_000_000)
+            m.header.stamp.nanosec = int(timestamp_ns %  1_000_000_000)
+            m.ns     = 'actors'
+            m.id     = tr.id % 10_000
+            m.type   = Marker.CUBE
+            m.action = Marker.ADD
+            m.scale.x = 4.5; m.scale.y = 2.0; m.scale.z = 1.5
+            m.color.r = 1.0; m.color.g = 0.5; m.color.b = 0.0; m.color.a = 0.85
+            m.pose.position.x    = x
+            m.pose.position.y    = y
+            m.pose.position.z    = 0.75
+            m.pose.orientation.w = 1.0
+            m.lifetime.sec = 1    # auto-expire so stale actors disappear
+            ma.markers.append(m)
+        return ma
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -831,18 +925,26 @@ def main():
                   f'from {geojson_path}')
         else:
             print(f'Warning: {geojson_path} not found — lane overlay disabled.')
+        writer.create_topic(rosbag2_py.TopicMetadata(
+            name=ACTORS_TOPIC,
+            type='visualization_msgs/msg/MarkerArray',
+            serialization_format='cdr',
+        ))
         print('Map matching enabled.')
 
-    tracker     = LaneTracker(alpha=0.25)
-    ego_est     = EgoStateEstimator()
-    speed_ms    = 0.0
-    frame_count = 0
-    total       = 0
+    tracker        = LaneTracker(alpha=0.25)
+    actor_tracker  = ActorTracker() if map_matcher else None
+    ego_est        = EgoStateEstimator()
+    speed_ms       = 0.0
+    frame_count    = 0
+    total          = 0
     ego_heading    = 0.0   # tracks latest heading for ego marker (from /vel)
     gps_heading    = None  # heading from consecutive GPS positions (fallback)
     prev_gps_lat   = None
     prev_gps_lon   = None
     bev_d_left     = None  # metres from detected left lane boundary (updated per frame)
+    latest_ego_x   = 0.0   # most recent ENU position from GPS (for actor projection)
+    latest_ego_y   = 0.0
 
     while reader.has_next():
         topic, data, timestamp = reader.read_next()
@@ -879,6 +981,7 @@ def main():
                         gps_msg.latitude, gps_msg.longitude, timestamp,
                         bev_d_left_m=bev_d_left,
                         ego_heading=heading_for_match)
+                    latest_ego_x, latest_ego_y = lx, ly
                     writer.write(EGO_MATCHED_FIX_TOPIC,
                                  serialize_message(matched_fix), timestamp)
                     writer.write(EGO_LANE_INFO_TOPIC,
@@ -943,6 +1046,18 @@ def main():
                 lane_overlay = detect_lanes(img, tracker, det_results.boxes)
                 d, bev_ok = tracker.bev_lateral()
                 bev_d_left = d if bev_ok else None
+
+                # actor tracking + markers (only when map-matching is active)
+                if actor_tracker is not None and det_results.boxes is not None:
+                    vehicle_boxes = [
+                        det_results.boxes.xyxy[i].tolist()
+                        for i in range(len(det_results.boxes))
+                        if int(det_results.boxes.cls[i].item()) in _ACT_VEHICLE_CLS
+                    ]
+                    actor_tracker.update(vehicle_boxes, latest_ego_x, latest_ego_y, ego_heading)
+                    actor_ma = actor_tracker.active_markers(timestamp)
+                    if actor_ma.markers:
+                        writer.write(ACTORS_TOPIC, serialize_message(actor_ma), timestamp)
 
                 # compose: YOLO boxes on clean frame, then blend lane overlay
                 annotated = det_results.plot()
