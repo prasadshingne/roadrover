@@ -166,7 +166,7 @@ python3 src/roadrover_perception/scripts/process_bag.py ~/roadrover_bags/session
 
 The localization runs in two stages per GPS fix:
 
-1. **GPS snap** — the raw fix is projected onto the nearest OSM road edge to get a signed lateral offset (positive = left of road direction). An edge-direction check (dot product of edge tangent vs ego heading from `/vel`) flips the sign when the nearest edge is the opposing carriageway on a divided highway.
+1. **GPS snap** — the raw fix is projected onto the nearest OSM road edge to get a signed lateral offset (positive = left of road direction). On divided highways `ox.nearest_edges()` can return the opposing carriageway; if the nearest edge's tangent strongly opposes ego heading (dot product < −0.3), the matcher searches all edges within 30 m for the closest heading-consistent alternative (dot > 0.3) and uses that instead.
 
 2. **BEV refinement** — after lane detection, the BEV image is used to measure `bev_d_left`: the ego's distance in metres from its detected left lane boundary. The self-calibrating scale is `LANE_WIDTH / lane_width_px`. The estimated left boundary position is `lateral_m + bev_d_left`, which is divided by `LANE_WIDTH` to get a continuous lane index. An EMA (α = 0.10) with a 4-fix hysteresis counter smooths the result and initialises at lane 1 (rightmost) to match typical highway driving.
 

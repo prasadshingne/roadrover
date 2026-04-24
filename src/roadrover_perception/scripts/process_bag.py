@@ -109,6 +109,16 @@ class MapMatcher:
         self._lane_change_count  = 0     # consecutive fixes proposing a lane change
         self._LANE_CHANGE_THRESH = 4     # fixes needed to confirm a lane change
 
+        # Pre-build edge geometry list for heading-consistent snap (used in match())
+        from shapely.geometry import LineString as _SHLine
+        self._edge_geoms = []
+        for eu, ev, ek, edata in self._G.edges(keys=True, data=True):
+            g = edata.get('geometry')
+            if g is None:
+                nu, nv = self._G.nodes[eu], self._G.nodes[ev]
+                g = _SHLine([(nu['x'], nu['y']), (nv['x'], nv['y'])])
+            self._edge_geoms.append((g, eu, ev, ek))
+
     def match(self, lat: float, lon: float, timestamp_ns: int,
               bev_d_left_m: float = None, ego_heading: float = 0.0):
         """
@@ -123,6 +133,41 @@ class MapMatcher:
         # ── Nearest edge ────────────────────────────────────────────────────
         (u, v, key), dist_deg = ox.nearest_edges(
             G, X=lon, Y=lat, return_dist=True)
+
+        # On divided highways ox.nearest_edges may return the oncoming carriageway.
+        # If the nearest edge strongly opposes ego heading, search within 30 m for
+        # the nearest edge that is heading-consistent (dot > 0.3).
+        from shapely.geometry import Point as _Pt
+        def _geom_of(eu, ev, ek):
+            g = G[eu][ev][ek].get('geometry')
+            if g is None:
+                from shapely.geometry import LineString as _L
+                nu, nv = G.nodes[eu], G.nodes[ev]
+                return _L([(nu['x'], nu['y']), (nv['x'], nv['y'])])
+            return g
+        def _heading_dot(g):
+            pd = g.project(_Pt(lon, lat))
+            pb = g.interpolate(max(0.0, pd - 1e-5))
+            pa = g.interpolate(min(g.length, pd + 1e-5))
+            clat = math.cos(math.radians(lat))
+            tx_ = (pa.x - pb.x) * clat * 111_320.0
+            ty_ = (pa.y - pb.y) * 111_320.0
+            n = math.sqrt(tx_*tx_ + ty_*ty_)
+            return (tx_*math.cos(ego_heading) + ty_*math.sin(ego_heading)) / n if n > 1e-9 else 1.0
+        _nearest_g = _geom_of(u, v, key)
+        if _heading_dot(_nearest_g) < -0.3:
+            _SEARCH_DEG = 30.0 / 111_320.0
+            _pt_q = _Pt(lon, lat)
+            _best_d = _nearest_g.distance(_pt_q)
+            for _eg, _eu, _ev, _ek in self._edge_geoms:
+                _b = _eg.bounds
+                if (_b[2] < lon - _SEARCH_DEG or _b[0] > lon + _SEARCH_DEG or
+                        _b[3] < lat - _SEARCH_DEG or _b[1] > lat + _SEARCH_DEG):
+                    continue
+                _d = _eg.distance(_pt_q)
+                if _d < _best_d and _heading_dot(_eg) > 0.3:
+                    _best_d, u, v, key = _d, _eu, _ev, _ek
+
         edge = G[u][v][key]
 
         # ── Road name ───────────────────────────────────────────────────────
