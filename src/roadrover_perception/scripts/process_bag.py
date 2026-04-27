@@ -55,11 +55,14 @@ _ACT_VEHICLE_H     = 1.5    # assumed vehicle height (metres)
 _ACT_MAX_DIST      = 80.0   # discard projections beyond this (metres)
 _ACT_VEHICLE_CLS   = {2, 3, 5, 7}   # COCO: car, motorcycle, bus, truck
 _ACT_IOU_THRESH    = 0.30
-_ACT_MAX_GAP       = 10             # frames a track survives without a detection
-_ACT_CONF_THRESH   = 0.40           # minimum YOLO confidence
-_ACT_BOX_ALPHA     = 0.40           # image-space box EMA weight (lower = smoother)
+_ACT_MAX_GAP       = 15             # frames a track survives without a detection
+_ACT_CONF_THRESH   = 0.40           # minimum YOLO confidence to START a new track
+_ACT_CONF_TRACK    = 0.25           # minimum confidence to UPDATE an existing track
+_ACT_DRAW_GAP_2D   = 2              # camera-view boxes: only when recently detected
+_ACT_DRAW_GAP_3D   = 8              # 3D markers: hold last ENU position through short gaps
+_ACT_BOX_ALPHA     = 0.40           # image-space box EMA weight
 _ACT_MAX_LAT       = 12.25          # max lateral offset (m) — drops oncoming traffic
-_ACT_EMA_ALPHA     = 0.35           # ego-relative position EMA weight
+_ACT_EMA_ALPHA     = 0.40           # ENU position EMA weight (global frame — see below)
 _ACT_HEAD_ALPHA    = 0.05           # heading EMA weight — slow to prevent spin
 _ACT_DIMS = {                       # YOLO class → (length, width, height) metres
     2: (4.5,  2.0, 1.5),            # car — same footprint as ego
@@ -245,16 +248,13 @@ class MapMatcher:
 
         if (bev_d_left_m is not None
                 and -LANE_WIDTH < bev_d_left_m < 2.0 * LANE_WIDTH):
-            # i_float counts lane boundaries from the nearest OSM edge:
-            #   i≈1 → rightmost lane (closest to edge), i≈N → leftmost lane.
-            # The +N/2 offset used by the road-centre convention is intentionally
-            # omitted: for divided motorways the OSM edge often lies near the road
-            # shoulder, not the centreline, so counting from the edge directly is
-            # more accurate.
-            i_float = (lateral_m + bev_d_left_m) / LANE_WIDTH
+            # make_map.py centres lanes on the OSM edge (road centreline convention).
+            # lateral_m is measured from the OSM edge = road centre, so we subtract
+            # N/2 to convert from "lanes from road centre" to "lane index from right".
+            i_float = (lateral_m + bev_d_left_m) / LANE_WIDTH - total_lanes / 2.0
             method  = 'bev'
         else:
-            i_float = lateral_m / LANE_WIDTH
+            i_float = lateral_m / LANE_WIDTH - total_lanes / 2.0
             method  = 'gps'
 
         # EMA smoothing + hysteresis:
@@ -286,14 +286,16 @@ class MapMatcher:
         # Using raw GPS coordinates for the ego ENU position therefore always
         # shows the ego marker in the wrong lane (or off-road entirely).
         #
-        # Empirically verified: for this CA-85 motorway session the OSM way
-        # geometry lies at the LEFT boundary of the right carriageway.  All
-        # lane markers in lanes.geojson extend to the RIGHT of the snap point:
-        #   snap (left edge) → +3.5 m (lane boundary) → +7.0 m (lane boundary)
-        #                    → +10.5 m (right shoulder edge)
-        # Offset formula (right-of-travel from the left boundary to lane centre):
-        #   lane 1 (rightmost) → (N – 0.5) × LANE_WIDTH
-        #   lane N (leftmost)  →       0.5  × LANE_WIDTH
+        # make_map.py centres lanes symmetrically on the OSM edge (road centreline
+        # convention — matching actual OSM road geometry).  The snap point therefore
+        # lands at the CENTRE of the carriageway.  Offset formula:
+        #   offset = (N/2 – lane_num + 0.5) × LANE_WIDTH  (right-of-travel)
+        #   lane 1 (rightmost) → +0.5 × LANE_WIDTH  (for N=2)
+        #   lane N (leftmost)  → −0.5 × LANE_WIDTH  (for N=2)
+        #
+        # !! DO NOT REVERT TO (N – lane_num + 0.5) × LANE_WIDTH !!
+        # That formula assumed snap = left road boundary (old make_map.py behaviour).
+        # It would place the ego ~N/2 × LANE_WIDTH too far to the right.
         #
         # The snap point reliably tracks the road position regardless of GPS
         # lateral error, making it the correct base for lane-level positioning.
@@ -314,7 +316,7 @@ class MapMatcher:
         # Do not apply the offset if heading is invalid (speed < MIN_SPEED);
         # a zero heading would project the offset southward instead of rightward.
         if heading_valid:
-            offset = (total_lanes - lane_num + 0.5) * LANE_WIDTH
+            offset = (total_lanes / 2.0 - lane_num + 0.5) * LANE_WIDTH
             lane_enu_x = sx + offset * math.sin(ego_heading)
             lane_enu_y = sy - offset * math.cos(ego_heading)
         else:
@@ -828,15 +830,20 @@ def _act_iou(a, b) -> float:
 
 
 class _ActorTrack:
+    # ENU position is smoothed in the GLOBAL frame, not ego-relative.
+    # Smoothing ego-relative d_rel causes "back-and-forth" oscillation: as ego
+    # moves, d_fwd changes every frame, so a stale d_smooth and a fresh YOLO
+    # measurement fight each other after every gap.  In ENU space a stationary
+    # or slow actor barely moves, so the EMA is well-behaved and holds position
+    # correctly through short YOLO gaps without any ego-motion coupling.
     _next_id = 0
-    def __init__(self, box, cls, d_rel):
+    def __init__(self, box, cls):
         self.id          = _ActorTrack._next_id; _ActorTrack._next_id += 1
         self.box         = list(box)
         self.box_smooth  = list(box)
         self.cls         = cls
         self.cls_votes   = {cls: 1}
-        self.d_smooth    = list(d_rel) if d_rel is not None else None
-        self.enu         = None
+        self.enu         = None   # EMA-smoothed ENU position (global frame)
         self.heading_ema = None
         self.gap         = 0
 
@@ -846,9 +853,10 @@ class ActorTracker:
         self._active: list[_ActorTrack] = []
 
     def update(self, detections, ego_x: float, ego_y: float, ego_heading: float):
-        """detections: list of (box, cls) tuples for vehicle detections this frame."""
+        """detections: list of (box, cls, conf) tuples above _ACT_CONF_TRACK threshold."""
         boxes = [d[0] for d in detections]
         clss  = [d[1] for d in detections]
+        confs = [d[2] for d in detections]
         matched_t: set = set(); matched_d: set = set()
         iou_m = np.zeros((len(self._active), len(boxes)))
         for ti, tr in enumerate(self._active):
@@ -863,23 +871,23 @@ class ActorTracker:
             tr.box = b
             d_rel = _act_box_to_rel(tr.box_smooth)
             if d_rel is not None:
-                ea = _ACT_EMA_ALPHA
-                if tr.d_smooth is None:
-                    tr.d_smooth = list(d_rel)
+                enu_raw = _act_rel_to_enu(d_rel[0], d_rel[1], ego_x, ego_y, ego_heading)
+                if tr.enu is None:
+                    tr.enu = enu_raw
                 else:
-                    tr.d_smooth = [ea * d_rel[k] + (1 - ea) * tr.d_smooth[k] for k in range(2)]
-                enu_new = _act_rel_to_enu(tr.d_smooth[0], tr.d_smooth[1],
-                                          ego_x, ego_y, ego_heading)
-                tr.enu = enu_new
+                    ea = _ACT_EMA_ALPHA
+                    tr.enu = (ea * enu_raw[0] + (1 - ea) * tr.enu[0],
+                              ea * enu_raw[1] + (1 - ea) * tr.enu[1])
             tr.cls_votes[clss[di]] = tr.cls_votes.get(clss[di], 0) + 1
             tr.cls = max(tr.cls_votes, key=tr.cls_votes.get)
             tr.gap = 0
             matched_t.add(ti); matched_d.add(di)
             iou_m[ti, :] = 0.0; iou_m[:, di] = 0.0
         for di, b in enumerate(boxes):
-            if di not in matched_d:
+            # New tracks require high confidence; existing tracks already updated above.
+            if di not in matched_d and confs[di] >= _ACT_CONF_THRESH:
+                tr = _ActorTrack(b, clss[di])
                 d_rel = _act_box_to_rel(b)
-                tr = _ActorTrack(b, clss[di], d_rel)
                 if d_rel is not None:
                     tr.enu = _act_rel_to_enu(d_rel[0], d_rel[1], ego_x, ego_y, ego_heading)
                 self._active.append(tr)
@@ -892,9 +900,9 @@ class ActorTracker:
         self._active = still
 
     def draw_on(self, img: np.ndarray) -> None:
-        """Draw smoothed bounding boxes for active tracks with gap ≤ 2."""
+        """Draw smoothed bounding boxes — only when recently detected (no ghost boxes)."""
         for tr in self._active:
-            if tr.gap > 2:
+            if tr.gap > _ACT_DRAW_GAP_2D:
                 continue
             x1, y1, x2, y2 = [int(round(v)) for v in tr.box_smooth]
             name = _COCO_VEHICLE_NAMES.get(tr.cls, 'vehicle')
@@ -905,7 +913,7 @@ class ActorTracker:
     def active_markers(self, timestamp_ns: int, ego_heading: float = 0.0) -> MarkerArray:
         ma = MarkerArray()
         for tr in self._active:
-            if tr.enu is None or tr.gap > 2:
+            if tr.enu is None or tr.gap > _ACT_DRAW_GAP_3D:
                 continue
             x, y = tr.enu
             heading = tr.heading_ema if tr.heading_ema is not None else ego_heading
@@ -1074,6 +1082,9 @@ def main():
     bev_d_left     = None  # metres from detected left lane boundary (updated per frame)
     latest_ego_x   = 0.0   # most recent ENU position from GPS (for actor projection)
     latest_ego_y   = 0.0
+    dr_ego_x       = 0.0   # dead-reckoned ENU x (East): integrates velocity between 1 Hz GPS fixes
+    dr_ego_y       = 0.0   # dead-reckoned ENU y (North): keeps actor ENU smooth at camera frame rate
+    prev_cam_ts    = None  # nanosecond timestamp of previous camera frame
 
     while reader.has_next():
         topic, data, timestamp = reader.read_next()
@@ -1113,6 +1124,7 @@ def main():
                         ego_heading=heading_for_match,
                         heading_valid=heading_valid)
                     latest_ego_x, latest_ego_y = lx, ly
+                    dr_ego_x, dr_ego_y = lx, ly   # anchor dead-reckoning to map-matched fix
                     writer.write(EGO_MATCHED_FIX_TOPIC,
                                  serialize_message(matched_fix), timestamp)
                     writer.write(EGO_LANE_INFO_TOPIC,
@@ -1180,14 +1192,24 @@ def main():
 
                 # actor tracking + markers (only when map-matching is active)
                 if actor_tracker is not None:
+                    # Dead-reckon ego between 1 Hz GPS fixes so actor ENU stays smooth.
+                    # Without this, ego_pos is frozen for ~30 frames → actor drifts 27 m
+                    # then snaps on each GPS fix, producing the back-and-forth oscillation.
+                    if prev_cam_ts is not None and speed_ms > 0.1:
+                        dt = (timestamp - prev_cam_ts) / 1e9
+                        dr_ego_x += speed_ms * math.cos(ego_heading) * dt
+                        dr_ego_y += speed_ms * math.sin(ego_heading) * dt
+                    prev_cam_ts = timestamp
                     vehicle_dets = []
                     if det_results.boxes is not None:
                         for i in range(len(det_results.boxes)):
                             ci = int(det_results.boxes.cls[i].item())
                             fi = float(det_results.boxes.conf[i].item())
-                            if ci in _ACT_VEHICLE_CLS and fi >= _ACT_CONF_THRESH:
-                                vehicle_dets.append((det_results.boxes.xyxy[i].tolist(), ci))
-                    actor_tracker.update(vehicle_dets, latest_ego_x, latest_ego_y, ego_heading)
+                            # Collect at low threshold; update() only starts NEW tracks
+                            # at _ACT_CONF_THRESH (hysteresis prevents flicker near border).
+                            if ci in _ACT_VEHICLE_CLS and fi >= _ACT_CONF_TRACK:
+                                vehicle_dets.append((det_results.boxes.xyxy[i].tolist(), ci, fi))
+                    actor_tracker.update(vehicle_dets, dr_ego_x, dr_ego_y, ego_heading)
                     actor_ma = actor_tracker.active_markers(timestamp, ego_heading)
                     writer.write(ACTORS_TOPIC, serialize_message(actor_ma), timestamp)
 
