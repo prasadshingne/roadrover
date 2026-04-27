@@ -91,7 +91,8 @@ def box_to_enu(box, ego_x: float, ego_y: float,
     if d_fwd > MAX_PROJ_DIST:
         return None
     u_c   = (x1 + x2) / 2.0
-    d_lat = (u_c - CX) * d_fwd / F_PX   # positive = right in image
+    # Camera is 180°-rotated: negate so positive d_lat = left of travel direction.
+    d_lat = (CX - u_c) * d_fwd / F_PX
     sin_h, cos_h = math.sin(ego_heading), math.cos(ego_heading)
     dx = d_fwd * cos_h - d_lat * sin_h
     dy = d_fwd * sin_h + d_lat * cos_h

@@ -166,11 +166,20 @@ python3 src/roadrover_perception/scripts/process_bag.py ~/roadrover_bags/session
 
 The localization runs in two stages per GPS fix:
 
-1. **GPS snap** — the raw fix is projected onto the nearest OSM road edge to get a signed lateral offset (positive = left of road direction). On divided highways `ox.nearest_edges()` can return the opposing carriageway; if the nearest edge's tangent strongly opposes ego heading (dot product < −0.3), the matcher searches all edges within 30 m for the closest heading-consistent alternative (dot > 0.3) and uses that instead.
+1. **GPS snap** — the raw fix is projected onto the nearest OSM road edge to get the road position along the route. On divided highways `ox.nearest_edges()` can return the opposing carriageway; if the nearest edge's tangent strongly opposes ego heading (dot product < −0.3), the matcher searches all edges within 30 m for the closest heading-consistent alternative (dot > 0.3) and uses that instead.
 
-2. **BEV refinement** — after lane detection, the BEV image is used to measure `bev_d_left`: the ego's distance in metres from its detected left lane boundary. The self-calibrating scale is `LANE_WIDTH / lane_width_px`. The estimated left boundary position is `lateral_m + bev_d_left`, which is divided by `LANE_WIDTH` to get a continuous lane index. An EMA (α = 0.10) with a 4-fix hysteresis counter smooths the result and initialises at lane 1 (rightmost) to match typical highway driving.
+2. **Lane-centre placement** — the snap point is EMA-smoothed (α = 0.6) to absorb GPS-fix jitter, then offset laterally to the detected lane centre using:
+
+   ```
+   ego_x = snap_x + (N − lane_num + 0.5) × LANE_WIDTH × sin(heading)
+   ego_y = snap_y − (N − lane_num + 0.5) × LANE_WIDTH × cos(heading)
+   ```
+
+   `lane_num` (1 = rightmost) is estimated from the BEV camera's `bev_d_left` measurement (distance in metres to the ego's left lane boundary), EMA-smoothed with α = 0.10 and a 4-fix hysteresis counter to prevent transient jumps.
 
 The `/ego/lane_info` string topic reports `road | lane k/N [method] | gps_offset ±X m | bev_d_left Y m` for every GPS fix.
+
+> **Why not use raw GPS for the lateral position?**  GPS lateral accuracy on a motorway is typically 5–15 m — far worse than a lane width — due to multipath reflections from trees, bridges, and nearby structures.  In recorded sessions the GPS antenna reported a position ~10 m west of the ego's actual lane, placing it in the median when converted directly to ENU.  The OSM snap point reliably tracks the road regardless of this lateral error and is the correct base for lane-level positioning. **Do not replace the snap + offset formula with raw GPS coordinates.**
 
 ### Viewing in Foxglove
 
@@ -232,7 +241,7 @@ This reads the `/fix` GPS track from the bag, downloads the matching OSM road gr
 | `lanes.geojson` | Lane boundary lines — consumed by `process_bag.py` for `/map/lanes` markers |
 | `map_graph.pkl` | Pickled osmnx graph — passed to `process_bag.py` via `--map-graph` |
 
-Lane boundaries are computed per OSM edge: one-way roads get lanes centred on the OSM edge (±half road width); bidirectional roads split lanes left and right of the centreline.
+Lane boundaries are computed per OSM edge using `shapely.offset_curve`. For one-way roads the lanes are intended to be centred on the OSM edge, but for tightly-curved geometries the left-side offset curves can collapse; in practice all lane markers extend to the **right** of the OSM edge. Bidirectional roads split lanes left and right of the centreline. The ego positioning formula in `process_bag.py` is calibrated to this "OSM edge = left road boundary" convention.
 
 ```bash
 # 2. (Optional) Generate OpenDRIVE for simulation

@@ -55,7 +55,19 @@ _ACT_VEHICLE_H     = 1.5    # assumed vehicle height (metres)
 _ACT_MAX_DIST      = 80.0   # discard projections beyond this (metres)
 _ACT_VEHICLE_CLS   = {2, 3, 5, 7}   # COCO: car, motorcycle, bus, truck
 _ACT_IOU_THRESH    = 0.30
-_ACT_MAX_GAP       = 5
+_ACT_MAX_GAP       = 10             # frames a track survives without a detection
+_ACT_CONF_THRESH   = 0.40           # minimum YOLO confidence
+_ACT_BOX_ALPHA     = 0.40           # image-space box EMA weight (lower = smoother)
+_ACT_MAX_LAT       = 12.25          # max lateral offset (m) — drops oncoming traffic
+_ACT_EMA_ALPHA     = 0.35           # ego-relative position EMA weight
+_ACT_HEAD_ALPHA    = 0.05           # heading EMA weight — slow to prevent spin
+_ACT_DIMS = {                       # YOLO class → (length, width, height) metres
+    2: (4.5,  2.0, 1.5),            # car — same footprint as ego
+    3: (2.2,  0.8, 1.2),            # motorcycle
+    5: (12.0, 2.5, 3.5),            # bus
+    7: (8.0,  2.5, 3.0),            # truck
+}
+_COCO_VEHICLE_NAMES = {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
 
 
 # ── Image rotation helpers ────────────────────────────────────────────────────
@@ -105,6 +117,8 @@ class MapMatcher:
         self.lon0 = float(np.mean(lons))
         self._lane_ema           = 1.0   # EMA of continuous lane index; init = rightmost (1)
         self._lane_alpha         = 0.10  # EMA weight for new estimates (slow)
+        self._lateral_m_ema      = None  # used only for lane_info string
+        self._enu_ema            = None  # asymmetric-smoothed GPS ENU position
         self._lane_num           = 1     # confirmed lane (hysteresis-filtered)
         self._lane_change_count  = 0     # consecutive fixes proposing a lane change
         self._LANE_CHANGE_THRESH = 4     # fixes needed to confirm a lane change
@@ -120,7 +134,8 @@ class MapMatcher:
             self._edge_geoms.append((g, eu, ev, ek))
 
     def match(self, lat: float, lon: float, timestamp_ns: int,
-              bev_d_left_m: float = None, ego_heading: float = 0.0):
+              bev_d_left_m: float = None, ego_heading: float = 0.0,
+              heading_valid: bool = True):
         """
         Returns (matched_NavSatFix, lane_info_String, (enu_x, enu_y)).
         bev_d_left_m: ego's distance in metres from the detected left lane boundary
@@ -261,36 +276,52 @@ class MapMatcher:
         self._lane_num = max(1, min(total_lanes, self._lane_num))
         lane_num = self._lane_num
 
-        # ── Lane-centre ENU position ─────────────────────────────────────────
-        # Shift the road snap point laterally to the centre of the matched lane.
-        # lateral_m_center: signed offset from road centreline to lane centre
-        #   positive = left of travel direction, negative = right
-        lateral_m_center = (lane_num - 0.5) * LANE_WIDTH - total_lanes / 2.0 * LANE_WIDTH
-
+        # ── ENU position: snap + lane-centre offset ─────────────────────────────
+        #
+        # !! DO NOT REPLACE THIS WITH RAW GPS !!
+        #
+        # GPS lateral accuracy on a motorway is typically 5–15 m — far worse
+        # than a lane width.  In our bags the GPS antenna reports a position
+        # that is ~10 m west of the ego's actual lane, placing it in the median.
+        # Using raw GPS coordinates for the ego ENU position therefore always
+        # shows the ego marker in the wrong lane (or off-road entirely).
+        #
+        # Empirically verified: for this CA-85 motorway session the OSM way
+        # geometry lies at the LEFT boundary of the right carriageway.  All
+        # lane markers in lanes.geojson extend to the RIGHT of the snap point:
+        #   snap (left edge) → +3.5 m (lane boundary) → +7.0 m (lane boundary)
+        #                    → +10.5 m (right shoulder edge)
+        # Offset formula (right-of-travel from the left boundary to lane centre):
+        #   lane 1 (rightmost) → (N – 0.5) × LANE_WIDTH
+        #   lane N (leftmost)  →       0.5  × LANE_WIDTH
+        #
+        # The snap point reliably tracks the road position regardless of GPS
+        # lateral error, making it the correct base for lane-level positioning.
         cos_lat0 = math.cos(math.radians(self.lat0))
-        snap_x   = (snap_lon - self.lon0) * cos_lat0 * 111_320.0
-        snap_y   = (snap_lat - self.lat0) * 111_320.0
+        snap_x = (snap_lon - self.lon0) * cos_lat0 * 111_320.0
+        snap_y = (snap_lat - self.lat0) * 111_320.0
 
-        if geom is not None:
-            # Road tangent in ENU metres, normalised
-            tang_x   = tx * cos_lat0 * 111_320.0
-            tang_y   = ty * 111_320.0
-            tang_len = math.sqrt(tang_x ** 2 + tang_y ** 2)
-            if tang_len > 1e-9:
-                tang_x /= tang_len
-                tang_y /= tang_len
-            # Perpendicular left of travel: rotate tangent 90° CCW
-            perp_x = -tang_y
-            perp_y =  tang_x
+        # EMA-smooth the snap point to absorb GPS-fix jitter along the road.
+        if self._enu_ema is None:
+            self._enu_ema = [snap_x, snap_y]
         else:
-            perp_x, perp_y = 0.0, 1.0   # fallback: north
+            _a = 0.6
+            self._enu_ema[0] = _a * snap_x + (1.0 - _a) * self._enu_ema[0]
+            self._enu_ema[1] = _a * snap_y + (1.0 - _a) * self._enu_ema[1]
+        sx, sy = self._enu_ema
 
-        lane_enu_x = snap_x + lateral_m_center * perp_x
-        lane_enu_y = snap_y + lateral_m_center * perp_y
+        # Right-of-travel vector in ENU: (sin h, -cos h).
+        # Do not apply the offset if heading is invalid (speed < MIN_SPEED);
+        # a zero heading would project the offset southward instead of rightward.
+        if heading_valid:
+            offset = (total_lanes - lane_num + 0.5) * LANE_WIDTH
+            lane_enu_x = sx + offset * math.sin(ego_heading)
+            lane_enu_y = sy - offset * math.cos(ego_heading)
+        else:
+            lane_enu_x, lane_enu_y = sx, sy
 
-        # Convert lane centre back to lat/lon for the NavSatFix
-        lane_lat = lane_enu_y / 111_320.0 + self.lat0
-        lane_lon = lane_enu_x / (cos_lat0 * 111_320.0) + self.lon0
+        lane_lat = snap_lat
+        lane_lon = snap_lon
 
         # ── Build ROS messages ──────────────────────────────────────────────
         h = Header()
@@ -766,8 +797,8 @@ def make_ego_pose(x: float, y: float, heading: float,
 
 # ── Actor tracking ───────────────────────────────────────────────────────────
 
-def _act_box_to_enu(box, ego_x: float, ego_y: float,
-                    ego_heading: float):
+def _act_box_to_rel(box):
+    """Convert YOLO box to ego-relative (d_fwd, d_lat) in metres, or None."""
     x1, y1, x2, y2 = box
     box_h = y2 - y1
     if box_h < 5:
@@ -775,7 +806,14 @@ def _act_box_to_enu(box, ego_x: float, ego_y: float,
     d_fwd = _ACT_F_PX * _ACT_VEHICLE_H / box_h
     if d_fwd > _ACT_MAX_DIST:
         return None
-    d_lat = ((x1 + x2) / 2.0 - _ACT_CX) * d_fwd / _ACT_F_PX
+    d_lat = (_ACT_CX - (x1 + x2) / 2.0) * d_fwd / _ACT_F_PX
+    if abs(d_lat) > _ACT_MAX_LAT:
+        return None
+    return d_fwd, d_lat
+
+
+def _act_rel_to_enu(d_fwd: float, d_lat: float,
+                    ego_x: float, ego_y: float, ego_heading: float):
     sh, ch = math.sin(ego_heading), math.cos(ego_heading)
     return ego_x + d_fwd * ch - d_lat * sh, ego_y + d_fwd * sh + d_lat * ch
 
@@ -791,16 +829,26 @@ def _act_iou(a, b) -> float:
 
 class _ActorTrack:
     _next_id = 0
-    def __init__(self, box, enu):
-        self.id  = _ActorTrack._next_id; _ActorTrack._next_id += 1
-        self.box = box; self.enu = enu; self.gap = 0
+    def __init__(self, box, cls, d_rel):
+        self.id          = _ActorTrack._next_id; _ActorTrack._next_id += 1
+        self.box         = list(box)
+        self.box_smooth  = list(box)
+        self.cls         = cls
+        self.cls_votes   = {cls: 1}
+        self.d_smooth    = list(d_rel) if d_rel is not None else None
+        self.enu         = None
+        self.heading_ema = None
+        self.gap         = 0
 
 
 class ActorTracker:
     def __init__(self):
         self._active: list[_ActorTrack] = []
 
-    def update(self, boxes, ego_x: float, ego_y: float, ego_heading: float):
+    def update(self, detections, ego_x: float, ego_y: float, ego_heading: float):
+        """detections: list of (box, cls) tuples for vehicle detections this frame."""
+        boxes = [d[0] for d in detections]
+        clss  = [d[1] for d in detections]
         matched_t: set = set(); matched_d: set = set()
         iou_m = np.zeros((len(self._active), len(boxes)))
         for ti, tr in enumerate(self._active):
@@ -808,14 +856,33 @@ class ActorTracker:
                 iou_m[ti, di] = _act_iou(tr.box, b)
         while iou_m.size > 0 and iou_m.max() >= _ACT_IOU_THRESH:
             ti, di = np.unravel_index(iou_m.argmax(), iou_m.shape)
-            self._active[ti].box = boxes[di]
-            self._active[ti].enu = _act_box_to_enu(boxes[di], ego_x, ego_y, ego_heading)
-            self._active[ti].gap = 0
+            tr = self._active[ti]
+            b  = boxes[di]
+            a  = _ACT_BOX_ALPHA
+            tr.box_smooth = [a * b[k] + (1 - a) * tr.box_smooth[k] for k in range(4)]
+            tr.box = b
+            d_rel = _act_box_to_rel(tr.box_smooth)
+            if d_rel is not None:
+                ea = _ACT_EMA_ALPHA
+                if tr.d_smooth is None:
+                    tr.d_smooth = list(d_rel)
+                else:
+                    tr.d_smooth = [ea * d_rel[k] + (1 - ea) * tr.d_smooth[k] for k in range(2)]
+                enu_new = _act_rel_to_enu(tr.d_smooth[0], tr.d_smooth[1],
+                                          ego_x, ego_y, ego_heading)
+                tr.enu = enu_new
+            tr.cls_votes[clss[di]] = tr.cls_votes.get(clss[di], 0) + 1
+            tr.cls = max(tr.cls_votes, key=tr.cls_votes.get)
+            tr.gap = 0
             matched_t.add(ti); matched_d.add(di)
             iou_m[ti, :] = 0.0; iou_m[:, di] = 0.0
         for di, b in enumerate(boxes):
             if di not in matched_d:
-                self._active.append(_ActorTrack(b, _act_box_to_enu(b, ego_x, ego_y, ego_heading)))
+                d_rel = _act_box_to_rel(b)
+                tr = _ActorTrack(b, clss[di], d_rel)
+                if d_rel is not None:
+                    tr.enu = _act_rel_to_enu(d_rel[0], d_rel[1], ego_x, ego_y, ego_heading)
+                self._active.append(tr)
         still = []
         for ti, tr in enumerate(self._active):
             if ti not in matched_t:
@@ -824,12 +891,25 @@ class ActorTracker:
                 still.append(tr)
         self._active = still
 
-    def active_markers(self, timestamp_ns: int) -> MarkerArray:
+    def draw_on(self, img: np.ndarray) -> None:
+        """Draw smoothed bounding boxes for active tracks with gap ≤ 2."""
+        for tr in self._active:
+            if tr.gap > 2:
+                continue
+            x1, y1, x2, y2 = [int(round(v)) for v in tr.box_smooth]
+            name = _COCO_VEHICLE_NAMES.get(tr.cls, 'vehicle')
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 200, 255), 2)
+            cv2.putText(img, name, (x1, max(y1 - 4, 0)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1, cv2.LINE_AA)
+
+    def active_markers(self, timestamp_ns: int, ego_heading: float = 0.0) -> MarkerArray:
         ma = MarkerArray()
         for tr in self._active:
-            if tr.enu is None:
+            if tr.enu is None or tr.gap > 2:
                 continue
             x, y = tr.enu
+            heading = tr.heading_ema if tr.heading_ema is not None else ego_heading
+            dims = _ACT_DIMS.get(tr.cls, (4.5, 2.0, 1.5))
             m = Marker()
             m.header.frame_id      = 'map'
             m.header.stamp.sec     = int(timestamp_ns // 1_000_000_000)
@@ -838,13 +918,17 @@ class ActorTracker:
             m.id     = tr.id % 10_000
             m.type   = Marker.CUBE
             m.action = Marker.ADD
-            m.scale.x = 4.5; m.scale.y = 2.0; m.scale.z = 1.5
+            m.scale.x = dims[0]; m.scale.y = dims[1]; m.scale.z = dims[2]
             m.color.r = 1.0; m.color.g = 0.5; m.color.b = 0.0; m.color.a = 0.85
-            m.pose.position.x    = x
-            m.pose.position.y    = y
-            m.pose.position.z    = 0.75
-            m.pose.orientation.w = 1.0
-            m.lifetime.sec = 1    # auto-expire so stale actors disappear
+            m.pose.position.x = x
+            m.pose.position.y = y
+            m.pose.position.z = dims[2] / 2.0
+            half = heading / 2.0
+            m.pose.orientation.x = 0.0
+            m.pose.orientation.y = 0.0
+            m.pose.orientation.z = math.sin(half)
+            m.pose.orientation.w = math.cos(half)
+            m.lifetime.sec = 1
             ma.markers.append(m)
         return ma
 
@@ -1022,10 +1106,12 @@ def main():
                     prev_gps_lon = gps_msg.longitude
                     heading_for_match = (gps_heading if gps_heading is not None
                                          else ego_heading)
+                    heading_valid = speed_ms >= EgoStateEstimator._MIN_SPEED
                     matched_fix, lane_info, (lx, ly) = map_matcher.match(
                         gps_msg.latitude, gps_msg.longitude, timestamp,
                         bev_d_left_m=bev_d_left,
-                        ego_heading=heading_for_match)
+                        ego_heading=heading_for_match,
+                        heading_valid=heading_valid)
                     latest_ego_x, latest_ego_y = lx, ly
                     writer.write(EGO_MATCHED_FIX_TOPIC,
                                  serialize_message(matched_fix), timestamp)
@@ -1093,19 +1179,33 @@ def main():
                 bev_d_left = d if bev_ok else None
 
                 # actor tracking + markers (only when map-matching is active)
-                if actor_tracker is not None and det_results.boxes is not None:
-                    vehicle_boxes = [
-                        det_results.boxes.xyxy[i].tolist()
-                        for i in range(len(det_results.boxes))
-                        if int(det_results.boxes.cls[i].item()) in _ACT_VEHICLE_CLS
-                    ]
-                    actor_tracker.update(vehicle_boxes, latest_ego_x, latest_ego_y, ego_heading)
-                    actor_ma = actor_tracker.active_markers(timestamp)
-                    if actor_ma.markers:
-                        writer.write(ACTORS_TOPIC, serialize_message(actor_ma), timestamp)
+                if actor_tracker is not None:
+                    vehicle_dets = []
+                    if det_results.boxes is not None:
+                        for i in range(len(det_results.boxes)):
+                            ci = int(det_results.boxes.cls[i].item())
+                            fi = float(det_results.boxes.conf[i].item())
+                            if ci in _ACT_VEHICLE_CLS and fi >= _ACT_CONF_THRESH:
+                                vehicle_dets.append((det_results.boxes.xyxy[i].tolist(), ci))
+                    actor_tracker.update(vehicle_dets, latest_ego_x, latest_ego_y, ego_heading)
+                    actor_ma = actor_tracker.active_markers(timestamp, ego_heading)
+                    writer.write(ACTORS_TOPIC, serialize_message(actor_ma), timestamp)
 
-                # compose: YOLO boxes on clean frame, then blend lane overlay
-                annotated = det_results.plot()
+                # compose: smoothed vehicle boxes + non-vehicle detections + lane overlay
+                annotated = img.copy()
+                if det_results.boxes is not None:
+                    for i in range(len(det_results.boxes)):
+                        ci = int(det_results.boxes.cls[i].item())
+                        fi = float(det_results.boxes.conf[i].item())
+                        if ci not in _ACT_VEHICLE_CLS and fi >= _ACT_CONF_THRESH:
+                            x1, y1, x2, y2 = [int(v) for v in det_results.boxes.xyxy[i].tolist()]
+                            cv2.rectangle(annotated, (x1, y1), (x2, y2), (200, 200, 200), 1)
+                            cv2.putText(annotated, f'{det_results.names[ci]} {fi:.2f}',
+                                        (x1, max(y1 - 4, 0)),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1,
+                                        cv2.LINE_AA)
+                if actor_tracker is not None:
+                    actor_tracker.draw_on(annotated)
                 annotated = cv2.addWeighted(annotated, 1.0, lane_overlay, 0.35, 0)
                 draw_speed(annotated, speed_ms)
 
