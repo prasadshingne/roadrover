@@ -60,9 +60,7 @@ _ACT_CONF_THRESH   = 0.40           # minimum YOLO confidence to START a new tra
 _ACT_CONF_TRACK    = 0.25           # minimum confidence to UPDATE an existing track
 _ACT_DRAW_GAP_2D   = 2              # camera-view boxes: only when recently detected
 _ACT_DRAW_GAP_3D   = 8              # 3D markers: hold last ENU position through short gaps
-_ACT_BOX_ALPHA     = 0.40           # image-space box EMA weight
 _ACT_MAX_LAT       = 12.25          # max lateral offset (m) — drops oncoming traffic
-_ACT_EMA_ALPHA     = 0.40           # ENU position EMA weight (global frame — see below)
 _ACT_HEAD_ALPHA    = 0.05           # heading EMA weight — slow to prevent spin
 _ACT_DIMS = {                       # YOLO class → (length, width, height) metres
     2: (4.5,  2.0, 1.5),            # car — same footprint as ego
@@ -307,7 +305,7 @@ class MapMatcher:
         if self._enu_ema is None:
             self._enu_ema = [snap_x, snap_y]
         else:
-            _a = 0.6
+            _a = 0.4
             self._enu_ema[0] = _a * snap_x + (1.0 - _a) * self._enu_ema[0]
             self._enu_ema[1] = _a * snap_y + (1.0 - _a) * self._enu_ema[1]
         sx, sy = self._enu_ema
@@ -830,22 +828,14 @@ def _act_iou(a, b) -> float:
 
 
 class _ActorTrack:
-    # ENU position is smoothed in the GLOBAL frame, not ego-relative.
-    # Smoothing ego-relative d_rel causes "back-and-forth" oscillation: as ego
-    # moves, d_fwd changes every frame, so a stale d_smooth and a fresh YOLO
-    # measurement fight each other after every gap.  In ENU space a stationary
-    # or slow actor barely moves, so the EMA is well-behaved and holds position
-    # correctly through short YOLO gaps without any ego-motion coupling.
     _next_id = 0
     def __init__(self, box, cls):
-        self.id          = _ActorTrack._next_id; _ActorTrack._next_id += 1
-        self.box         = list(box)
-        self.box_smooth  = list(box)
-        self.cls         = cls
-        self.cls_votes   = {cls: 1}
-        self.enu         = None   # EMA-smoothed ENU position (global frame)
-        self.heading_ema = None
-        self.gap         = 0
+        self.id        = _ActorTrack._next_id; _ActorTrack._next_id += 1
+        self.box       = list(box)
+        self.cls       = cls
+        self.cls_votes = {cls: 1}
+        self.enu       = None   # last ENU position (raw, no smoothing)
+        self.gap       = 0
 
 
 class ActorTracker:
@@ -866,25 +856,16 @@ class ActorTracker:
             ti, di = np.unravel_index(iou_m.argmax(), iou_m.shape)
             tr = self._active[ti]
             b  = boxes[di]
-            a  = _ACT_BOX_ALPHA
-            tr.box_smooth = [a * b[k] + (1 - a) * tr.box_smooth[k] for k in range(4)]
             tr.box = b
-            d_rel = _act_box_to_rel(tr.box_smooth)
+            d_rel = _act_box_to_rel(b)
             if d_rel is not None:
-                enu_raw = _act_rel_to_enu(d_rel[0], d_rel[1], ego_x, ego_y, ego_heading)
-                if tr.enu is None:
-                    tr.enu = enu_raw
-                else:
-                    ea = _ACT_EMA_ALPHA
-                    tr.enu = (ea * enu_raw[0] + (1 - ea) * tr.enu[0],
-                              ea * enu_raw[1] + (1 - ea) * tr.enu[1])
+                tr.enu = _act_rel_to_enu(d_rel[0], d_rel[1], ego_x, ego_y, ego_heading)
             tr.cls_votes[clss[di]] = tr.cls_votes.get(clss[di], 0) + 1
             tr.cls = max(tr.cls_votes, key=tr.cls_votes.get)
             tr.gap = 0
             matched_t.add(ti); matched_d.add(di)
             iou_m[ti, :] = 0.0; iou_m[:, di] = 0.0
         for di, b in enumerate(boxes):
-            # New tracks require high confidence; existing tracks already updated above.
             if di not in matched_d and confs[di] >= _ACT_CONF_THRESH:
                 tr = _ActorTrack(b, clss[di])
                 d_rel = _act_box_to_rel(b)
@@ -900,11 +881,10 @@ class ActorTracker:
         self._active = still
 
     def draw_on(self, img: np.ndarray) -> None:
-        """Draw smoothed bounding boxes — only when recently detected (no ghost boxes)."""
         for tr in self._active:
             if tr.gap > _ACT_DRAW_GAP_2D:
                 continue
-            x1, y1, x2, y2 = [int(round(v)) for v in tr.box_smooth]
+            x1, y1, x2, y2 = [int(round(v)) for v in tr.box]
             name = _COCO_VEHICLE_NAMES.get(tr.cls, 'vehicle')
             cv2.rectangle(img, (x1, y1), (x2, y2), (0, 200, 255), 2)
             cv2.putText(img, name, (x1, max(y1 - 4, 0)),
@@ -916,7 +896,7 @@ class ActorTracker:
             if tr.enu is None or tr.gap > _ACT_DRAW_GAP_3D:
                 continue
             x, y = tr.enu
-            heading = tr.heading_ema if tr.heading_ema is not None else ego_heading
+            heading = ego_heading
             dims = _ACT_DIMS.get(tr.cls, (4.5, 2.0, 1.5))
             m = Marker()
             m.header.frame_id      = 'map'
@@ -1082,8 +1062,12 @@ def main():
     bev_d_left     = None  # metres from detected left lane boundary (updated per frame)
     latest_ego_x   = 0.0   # most recent ENU position from GPS (for actor projection)
     latest_ego_y   = 0.0
-    dr_ego_x       = 0.0   # dead-reckoned ENU x (East): integrates velocity between 1 Hz GPS fixes
-    dr_ego_y       = 0.0   # dead-reckoned ENU y (North): keeps actor ENU smooth at camera frame rate
+    dr_ego_x       = 0.0   # dead-reckoned ENU x (East)
+    dr_ego_y       = 0.0   # dead-reckoned ENU y (North)
+    dr_ego_init    = False # becomes True after first GPS fix places dr_ego at a valid position
+    dr_corr_x      = 0.0   # per-frame GPS correction (spread over ~30 frames to avoid 1 Hz jump)
+    dr_corr_y      = 0.0
+    dr_corr_left   = 0     # frames of correction remaining
     prev_cam_ts    = None  # nanosecond timestamp of previous camera frame
 
     while reader.has_next():
@@ -1124,7 +1108,16 @@ def main():
                         ego_heading=heading_for_match,
                         heading_valid=heading_valid)
                     latest_ego_x, latest_ego_y = lx, ly
-                    dr_ego_x, dr_ego_y = lx, ly   # anchor dead-reckoning to map-matched fix
+                    if not dr_ego_init:
+                        dr_ego_x, dr_ego_y = lx, ly   # first fix: place immediately
+                        dr_ego_init = True
+                    else:
+                        # Spread GPS correction over ~30 frames so actors don't jump
+                        # at 1 Hz. Dead reckoning runs each frame; this just corrects drift.
+                        _n = 30
+                        dr_corr_x    = (lx - dr_ego_x) / _n
+                        dr_corr_y    = (ly - dr_ego_y) / _n
+                        dr_corr_left = _n
                     writer.write(EGO_MATCHED_FIX_TOPIC,
                                  serialize_message(matched_fix), timestamp)
                     writer.write(EGO_LANE_INFO_TOPIC,
@@ -1192,14 +1185,19 @@ def main():
 
                 # actor tracking + markers (only when map-matching is active)
                 if actor_tracker is not None:
-                    # Dead-reckon ego between 1 Hz GPS fixes so actor ENU stays smooth.
-                    # Without this, ego_pos is frozen for ~30 frames → actor drifts 27 m
-                    # then snaps on each GPS fix, producing the back-and-forth oscillation.
+                    # 1. Dead-reckon ego forward by one camera frame.
                     if prev_cam_ts is not None and speed_ms > 0.1:
                         dt = (timestamp - prev_cam_ts) / 1e9
                         dr_ego_x += speed_ms * math.cos(ego_heading) * dt
                         dr_ego_y += speed_ms * math.sin(ego_heading) * dt
                     prev_cam_ts = timestamp
+                    # 2. Drip-feed GPS correction (~1/30 of total error per frame).
+                    #    Spreading the fix over 30 frames eliminates the 1 Hz jump that
+                    #    would otherwise appear in all actor ENU positions.
+                    if dr_corr_left > 0:
+                        dr_ego_x   += dr_corr_x
+                        dr_ego_y   += dr_corr_y
+                        dr_corr_left -= 1
                     vehicle_dets = []
                     if det_results.boxes is not None:
                         for i in range(len(det_results.boxes)):

@@ -202,6 +202,16 @@ Open the processed bag in Foxglove Studio (File → Open local file). Useful pan
 
 > **Foxglove 3D tip:** the TF visualizer draws a connection line between the `map` origin and `base_link`. To hide it, open the panel settings → **Transforms** → uncheck **Show connection lines**.
 
+### Known limitation: 3D actor position noise
+
+The orange actor boxes in the 3D view will visibly jitter. This is expected and has two root causes:
+
+**1. Monocular depth estimation is noisy.** Distance is inferred from bounding-box height using a pinhole model (`d = f × H / h_px`). YOLO's detection boundaries shift 5–15% frame-to-frame even for a stationary vehicle. At 40 m range, a 10% height variation translates to ±4 m of distance error per frame — with no depth sensor to correct it, this noise is irreducible.
+
+**2. GPS anchor discontinuity.** Ego position is updated at 1 Hz from GPS and dead-reckoned between fixes using NMEA velocity. Each GPS fix carries a new lateral error (motorway GPS accuracy is ±5–15 m). When the map-matched ego position shifts at a fix boundary, all actor ENU positions shift by the same amount simultaneously, appearing as a periodic snap in the 3D view.
+
+**Why not fix it?** Eliminating this properly requires hardware this rover doesn't have: a stereo camera or LiDAR for metric depth, or a radar for accurate radial distance. The tracking *identity* (which box belongs to which vehicle across frames) is correct — only the absolute 3D position estimate is noisy. Sensor fusion with any of those modalities would replace the bounding-box-height heuristic and solve both issues.
+
 ### Lane detection debug tool
 
 Inspect the BEV pipeline on a single frame without running the full bag:
