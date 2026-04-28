@@ -219,6 +219,14 @@ def build_xosc(ego_waypoints: list, actor_tracks: list[Track],
 
     t_scenario_start = ego_waypoints[0][0]
 
+    # ── 20-second cap — applied before building any XML ──────────────────────
+    T_LIMIT = 20.0
+    t_end   = t_scenario_start + T_LIMIT
+    ego_waypoints = [wp for wp in ego_waypoints if wp[0] <= t_end]
+    for track in actor_tracks:
+        track.waypoints = [wp for wp in track.waypoints if wp[0] <= t_end]
+    actor_tracks = [t for t in actor_tracks if len(t.waypoints) >= 2]
+
     def wp_to_world(wp) -> 'xosc.WorldPosition':
         _t_s, x, y, heading, _speed = wp
         return xosc.WorldPosition(x=x, y=y, h=heading)
@@ -241,20 +249,21 @@ def build_xosc(ego_waypoints: list, actor_tracks: list[Track],
         return [(wps[i][0], float(xs_s[i]), float(ys_s[i]), wps[i][3], wps[i][4])
                 for i in range(len(wps))]
 
-    def with_headings(waypoints: list) -> list:
-        """Return a copy of waypoints with heading derived from motion direction."""
+    def with_headings_and_speeds(waypoints: list) -> list:
+        """Derive heading and speed from consecutive position differences."""
         wps = list(waypoints)
         for i in range(len(wps) - 1):
-            t0, x0, y0, h0, s0 = wps[i]
-            _t1, x1, y1, _h1, _s1 = wps[i + 1]
+            t0, x0, y0, h0, _s0 = wps[i]
+            t1, x1, y1, _h1, _s1 = wps[i + 1]
             dx, dy = x1 - x0, y1 - y0
-            if dx * dx + dy * dy > 0.01:   # >0.1 m movement
-                h0 = math.atan2(dy, dx)
-            wps[i] = (t0, x0, y0, h0, s0)
+            dt = t1 - t0
+            dist2 = dx * dx + dy * dy
+            h = math.atan2(dy, dx) if dist2 > 0.01 else h0
+            s = math.sqrt(dist2) / dt if dt > 1e-4 else 0.0
+            wps[i] = (t0, x0, y0, h, s)
         if len(wps) > 1:
-            # last waypoint keeps the heading of the second-to-last
-            t, x, y, _, s = wps[-1]
-            wps[-1] = (t, x, y, wps[-2][3], s)
+            t, x, y, _, _ = wps[-1]
+            wps[-1] = (t, x, y, wps[-2][3], wps[-2][4])
         return wps
 
     def make_trajectory(name: str, waypoints: list, t_start: float) -> 'xosc.Trajectory':
@@ -325,8 +334,9 @@ def build_xosc(ego_waypoints: list, actor_tracks: list[Track],
     for track in actor_tracks:
         init.add_init_action(f'Actor_{track.id}',
                              xosc.TeleportAction(wp_to_world(track.waypoints[0])))
+        init_speed = track.waypoints[0][4] if track.waypoints else 0.0
         init.add_init_action(f'Actor_{track.id}',
-                             xosc.AbsoluteSpeedAction(speed=0.0,
+                             xosc.AbsoluteSpeedAction(speed=init_speed,
                                                        transition_dynamics=_step_dynamics()))
 
     # ── Story / StoryBoard ────────────────────────────────────────────────────
@@ -348,19 +358,52 @@ def build_xosc(ego_waypoints: list, actor_tracks: list[Track],
         act.add_maneuver_group(mg)
         return act
 
+    def _make_delete_act(act_name: str, entity_name: str, t_delete_rel: float) -> 'xosc.Act':
+        """Create an act that removes entity_name from the sim at t_delete_rel seconds."""
+        delete_action = xosc.DeleteEntityAction(entityref=entity_name)
+        event = xosc.Event(name=f'{act_name}Event', priority=xosc.Priority.overwrite)
+        event.add_action(actionname=f'{act_name}Action', action=delete_action)
+        time_cond = xosc.SimulationTimeCondition(value=t_delete_rel,
+                                                  rule=xosc.Rule.greaterOrEqual)
+        trigger = xosc.ValueTrigger(name=f'{act_name}Trigger', delay=0.0,
+                                    conditionedge=xosc.ConditionEdge.none,
+                                    valuecondition=time_cond)
+        event.add_trigger(trigger)
+        maneuver = xosc.Maneuver(name=f'{act_name}Maneuver')
+        maneuver.add_event(event)
+        mg = xosc.ManeuverGroup(name=f'{act_name}MG')
+        mg.add_actor('Ego')   # GlobalAction — actor ref is irrelevant; avoid self-ref
+        mg.add_maneuver(maneuver)
+        act = xosc.Act(name=act_name, starttrigger=_empty_trigger())
+        act.add_maneuver_group(mg)
+        return act
+
+    # ── Story ─────────────────────────────────────────────────────────────────
     story.add_act(_make_act('EgoAct', 'Ego',
                             make_trajectory('EgoTrajectory', ego_waypoints,
                                             t_scenario_start)))
     for track in actor_tracks:
+        wps = with_headings_and_speeds(smooth_positions(track.waypoints))
         story.add_act(_make_act(
             f'ActorAct_{track.id}',
             f'Actor_{track.id}',
-            make_trajectory(f'ActorTraj_{track.id}',
-                            with_headings(smooth_positions(track.waypoints)),
-                            t_scenario_start),
+            make_trajectory(f'ActorTraj_{track.id}', wps, t_scenario_start),
+        ))
+        # Remove actor when its track ends (left camera FOV)
+        t_last_rel = wps[-1][0] - t_scenario_start
+        story.add_act(_make_delete_act(
+            f'ActorDelete_{track.id}',
+            f'Actor_{track.id}',
+            t_last_rel,
         ))
 
-    storyboard = xosc.StoryBoard(init=init, stoptrigger=xosc.EmptyTrigger('stop'))
+    # Stop the scenario at 20 s
+    stop_cond = xosc.SimulationTimeCondition(value=T_LIMIT, rule=xosc.Rule.greaterOrEqual)
+    stoptrigger = xosc.ValueTrigger(name='StopTrigger', delay=0.0,
+                                    conditionedge=xosc.ConditionEdge.rising,
+                                    valuecondition=stop_cond,
+                                    triggeringpoint='stop')
+    storyboard = xosc.StoryBoard(init=init, stoptrigger=stoptrigger)
     storyboard.add_story(story)
 
     scenario = xosc.Scenario(

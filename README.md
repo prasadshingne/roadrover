@@ -289,6 +289,12 @@ The processed bag must have been produced by `process_bag.py --map-graph` (requi
 3. Project each bounding-box bottom-centre to ENU via a pinhole road-plane model
 4. Export tracks with ≥ 10 qualifying frames (configurable via `--min-track-frames`)
 
+**Scenario behaviour:**
+
+- **20-second cap** — only the first 20 seconds of the drive are exported. This keeps the scenario focused and avoids long static segments when actors leave the camera field of view.
+- **Actors disappear naturally** — each actor is given a `DeleteEntityAction` at the time its track ends (i.e. when it left the camera FOV), so actors vanish from the simulation rather than freezing in place.
+- **No trajectory extrapolation** — actor waypoints come directly from the YOLO detections. Extrapolating noisy monocular-camera positions produces physically implausible off-road paths, so actors simply end where they were last detected.
+
 **Verify in esmini:**
 
 ```bash
