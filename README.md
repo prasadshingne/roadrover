@@ -302,6 +302,16 @@ cd ~/roadrover_bags/scenario_out
 esmini --osc scenario.xosc --window 60 60 1200 800
 ```
 
+**Extracted scenario replayed in esmini** (ego + detected actors, 20 s):
+
+https://github.com/prasadshingne/roadrover/blob/main/docs/esmini_scenario.mp4
+
+**Real recording in Foxglove** (annotated camera feed, 3D lane markers, actor boxes):
+
+https://github.com/prasadshingne/roadrover/blob/main/docs/Map_actor_camera_view.mp4
+
+> Temporal alignment between the two views is approximate — GPS updates at 1 Hz and actor distances are estimated from bounding-box height on a monocular camera, so spatial correspondence is limited by those sensor constraints.
+
 ## Changing device paths
 
 If your camera or GPS receiver is on a different device node, edit the parameters in
