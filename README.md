@@ -304,11 +304,11 @@ esmini --osc scenario.xosc --window 60 60 1200 800
 
 **Extracted scenario replayed in esmini** (ego + detected actors, 20 s):
 
-[![esmini scenario](docs/esmini_thumbnail.jpg)](docs/esmini_scenario.mp4)
+![esmini scenario](docs/esmini_scenario.gif)
 
 **Real recording in Foxglove** (annotated camera feed, 3D lane markers, actor boxes):
 
-[![Foxglove recording](docs/foxglove_thumbnail.jpg)](docs/Map_actor_camera_view.mp4)
+![Foxglove recording](docs/foxglove_recording.gif)
 
 > Temporal alignment between the two views is approximate — GPS updates at 1 Hz and actor distances are estimated from bounding-box height on a monocular camera, so spatial correspondence is limited by those sensor constraints.
 
