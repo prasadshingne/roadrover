@@ -13,7 +13,6 @@ def generate_launch_description():
     )
 
     topics = [
-        '/usb_cam/image_raw',
         '/usb_cam/image_raw/compressed',
         '/usb_cam/camera_info',
         '/fix',
@@ -57,7 +56,9 @@ def generate_launch_description():
             output='screen',
         ),
         ExecuteProcess(
-            cmd=['ros2', 'bag', 'record', '--output', bag_path] + topics,
+            cmd=['ros2', 'bag', 'record',
+                 '--output', bag_path,
+                 '--max-bag-duration', '30'] + topics,
             output='screen',
         ),
     ])
