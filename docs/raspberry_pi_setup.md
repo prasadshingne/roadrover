@@ -1,6 +1,25 @@
 # RoadRover — Raspberry Pi 4 Setup Guide
 
+← [Back to main README](../README.md)
+
 End-to-end setup for running RoadRover data recording on a Raspberry Pi 4 with a USB camera and GPS receiver. Covers OS installation, ROS 2, device configuration, WiFi hotspot, and common issues found during bring-up.
+
+## Contents
+
+1. [Hardware](#hardware)
+2. [Flash Ubuntu 22.04 Server](#1-flash-ubuntu-2204-server-arm64)
+3. [First boot](#2-first-boot)
+4. [Enable SSH password authentication](#3-enable-ssh-password-authentication)
+5. [System update](#4-system-update)
+6. [Install ROS 2 Humble](#5-install-ros-2-humble)
+7. [Install ROS 2 packages](#6-install-ros-2-packages)
+8. [Install RoadRover](#7-install-roadrover)
+9. [Fix camera device path](#8-fix-camera-device-path)
+10. [Fix device permissions](#9-fix-device-permissions)
+11. [WiFi hotspot setup](#10-wifi-hotspot-setup-iphone--mobile-hotspot)
+12. [Running RoadRover](#11-running-roadrover)
+13. [Replaying bags on a laptop](#12-replaying-bags-on-a-laptop)
+14. [Troubleshooting](#troubleshooting)
 
 ---
 

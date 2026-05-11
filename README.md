@@ -2,14 +2,21 @@
 
 A ROS 2 Humble project for data collection, offline perception, lane detection, object detection, and ego state estimation, intended to run on a Raspberry Pi.
 
+## Guides
+
+| | |
+|---|---|
+| 🍓 **[Raspberry Pi 4 Setup](docs/raspberry_pi_setup.md)** | Full bring-up from flashing Ubuntu to first recording — start here if you are setting up new hardware |
+| 📖 **[README (this page)](#usage)** | ROS 2 package usage, launch files, offline pipeline, and API reference |
+
+---
+
 ## Hardware
 
 | Device | Default path |
 |--------|-------------|
 | USB camera | `/dev/video4` |
 | GPS receiver (NMEA serial) | `/dev/ttyUSB0` |
-
-> **Running on a Raspberry Pi?** See the [Raspberry Pi 4 setup guide](docs/raspberry_pi_setup.md) for OS installation, ROS 2 setup, device path fixes, WiFi hotspot, and Pi-specific troubleshooting.
 
 ## Prerequisites
 
