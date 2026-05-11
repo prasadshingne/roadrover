@@ -87,22 +87,68 @@ Starts all sensors and records the following topics to `~/roadrover_bags/session
 
 | Topic | Content |
 |-------|---------|
-| `/usb_cam/image_raw` | Raw camera frames |
-| `/usb_cam/image_raw/compressed` | Compressed camera frames |
+| `/usb_cam/image_raw/compressed` | Compressed camera frames (MJPEG) |
 | `/usb_cam/camera_info` | Camera calibration |
 | `/fix` | GPS position (NavSatFix) |
 | `/vel` | GPS velocity (TwistStamped) |
 | `/time_reference` | GPS time |
 
+The bag auto-splits into a new file every **30 seconds** (`--max-bag-duration 30`), keeping each file manageable for offline processing. Typical bag size is ~1 GB per 10 minutes of driving.
+
+> **Why no raw image topic?** `/usb_cam/image_raw` at 640×480 RGB 30 fps requires ~27 MB/s sustained write speed — at the limit of a Pi 4 SD card — and produces 20+ GB bags. Dropping it in favour of the compressed topic reduces write load to ~2 MB/s with no loss to the perception pipeline, which operates entirely on `/usb_cam/image_raw/compressed`.
+
 Stop recording with **Ctrl-C**. The bag is fully written before the process exits.
 
 ### Replay a session
 
+**Terminal 1** — start Foxglove bridge:
 ```bash
-ros2 launch roadrover_bringup replay.launch.py bag_path:=/path/to/session_<timestamp>
+ros2 launch roadrover_bringup replay.launch.py
 ```
 
-Plays the bag back and starts foxglove_bridge on port 8765 so you can inspect it in Foxglove Studio. The `--clock` flag is passed automatically so nodes that use `/clock` stay in sync with the recorded timeline.
+**Terminal 2** — play the bag:
+```bash
+ros2 bag play ~/roadrover_bags/session_<timestamp>
+```
+
+Then open Foxglove Studio at `ws://localhost:8765`. Useful playback flags:
+
+```bash
+ros2 bag play <path> --rate 0.5          # half speed
+ros2 bag play <path> --start-offset 30  # skip first 30 s
+ros2 bag play <path> --loop             # repeat continuously
+```
+
+### Session processing pipeline
+
+Process an entire recorded session — map download, chunk splitting, perception, and scenario extraction — in one command:
+
+```bash
+python3 src/roadrover_perception/scripts/pipeline_session.py ~/roadrover_bags/session_<timestamp>
+```
+
+The script prints a per-chunk dry-run table showing duration and peak speed, then waits for confirmation before writing any output. Pass `--yes` to skip the prompt in automated workflows.
+
+**What it does, in order:**
+
+| Step | Detail |
+|------|--------|
+| Velocity pre-check | Scans `/vel` messages; skips the entire session if the vehicle never exceeded 0.5 m/s |
+| Map download | Runs `make_map.py` once on the full session; result cached in `session_<ts>_map/` and reused on re-runs |
+| Chunk splitting | Splits the bag into 30 s chunks using `rosbag2_py`; raw chunks kept in `session_<ts>_chunks/chunk_NNN/` |
+| Skip stationary chunks | Any chunk whose peak speed < 0.5 m/s is skipped (e.g. waiting at traffic lights at session start) |
+| `process_bag.py` | Rotate 180° + lane detection + YOLO + map matching → `chunk_NNN_processed/` |
+| `make_scenario.py` | Ego + actor trajectory extraction → `chunk_NNN_scenario/scenario.xosc` + `map.xodr` |
+
+**Output layout:**
+```
+session_<ts>_map/          map_graph.pkl, map.geojson, lanes.geojson
+session_<ts>_chunks/
+  chunk_000/               raw 30 s bag (kept)
+  chunk_000_processed/     processed bag
+  chunk_000_scenario/      scenario.xosc + map.xodr
+  chunk_001/ ...
+```
 
 ## Offline perception pipeline
 
@@ -348,6 +394,10 @@ Update `port` accordingly. You may also need to add yourself to the `dialout` gr
 ```bash
 sudo usermod -aG dialout $USER   # log out and back in after this
 ```
+
+**Recording stops unexpectedly / usb_cam node crashes**
+
+This is caused by disk write pressure. Check that `/usb_cam/image_raw` is **not** in the recorded topics — the uncompressed image stream requires ~27 MB/s sustained, which exceeds typical SD card write throughput on a Pi 4 and causes the rosbag2 write queue to overflow. The current `record.launch.py` records only the compressed topic (~2 MB/s), which should not trigger this issue.
 
 **Cannot open Foxglove connection**
 - Confirm the bridge is running: `ros2 node list | grep foxglove`
