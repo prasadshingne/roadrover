@@ -9,6 +9,8 @@ A ROS 2 Humble project for data collection, offline perception, lane detection, 
 | USB camera | `/dev/video4` |
 | GPS receiver (NMEA serial) | `/dev/ttyUSB0` |
 
+> **Running on a Raspberry Pi?** See the [Raspberry Pi 4 setup guide](docs/raspberry_pi_setup.md) for OS installation, ROS 2 setup, device path fixes, WiFi hotspot, and Pi-specific troubleshooting.
+
 ## Prerequisites
 
 - Ubuntu 22.04 with ROS 2 Humble installed
