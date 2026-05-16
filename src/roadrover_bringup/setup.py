@@ -14,6 +14,7 @@ setup(
             'launch/bringup.launch.py',
             'launch/record.launch.py',
             'launch/replay.launch.py',
+            'launch/stereo.launch.py',
         ]),
     ],
     install_requires=['setuptools'],
