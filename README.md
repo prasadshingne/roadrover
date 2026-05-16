@@ -15,7 +15,8 @@ A ROS 2 Humble project for data collection, offline perception, lane detection, 
 
 | Device | Default path |
 |--------|-------------|
-| USB camera | `/dev/video4` |
+| USB camera (monocular) | `/dev/video4` |
+| Stereo USB camera (OV9715 dual-lens) | `/dev/video4` |
 | GPS receiver (NMEA serial) | `/dev/ttyUSB0` |
 
 ## Prerequisites
@@ -83,6 +84,49 @@ This starts three nodes:
 2. Click **Open connection** → **Foxglove WebSocket**.
 3. Enter `ws://<device-ip>:8765` (use `ws://localhost:8765` if running locally).
 4. Subscribe to `/usb_cam/image_raw` for camera feed and `/fix` for GPS.
+
+### Stereo camera
+
+For stereo-based depth estimation, connect the OV9715 synchronized dual-lens USB camera. It outputs a single side-by-side 1280×480 MJPEG frame which the `stereo_splitter` node splits into separate left and right topics.
+
+> **Implementation note:** `stereo_splitter` is a **C++ ROS 2 node** (`roadrover_stereo` package). It was written in C++ rather than Python because the two sequential JPEG encodes per frame at 30 fps exceed what Python can sustain — Python achieved only ~15 fps even with threading, while C++ delivers the full 30 fps.
+
+```bash
+ros2 launch roadrover_bringup stereo.launch.py
+```
+
+This starts `stereo_splitter` and `foxglove_bridge` on port 8765. Published topics:
+
+| Topic | Type | Content |
+|-------|------|---------|
+| `/stereo/left/image_raw/compressed` | `CompressedImage` | Left eye JPEG |
+| `/stereo/right/image_raw/compressed` | `CompressedImage` | Right eye JPEG |
+| `/stereo/left/camera_info` | `CameraInfo` | Left camera metadata (uncalibrated) |
+| `/stereo/right/camera_info` | `CameraInfo` | Right camera metadata (uncalibrated) |
+
+> **Why no raw image topics?** Uncompressed 640×480 BGR8 at 30 fps is ~900 KB per eye per frame (~54 MB/s total). Publishing compressed-only reduces bandwidth to ~3 MB/s with no loss to the perception pipeline.
+
+**Node parameters** (set in [stereo.launch.py](src/roadrover_bringup/launch/stereo.launch.py)):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `device` | `/dev/video4` | V4L2 device path |
+| `width` | `1280` | Combined frame width (both eyes) |
+| `height` | `480` | Frame height per eye |
+| `fps` | `30` | Camera frame rate (hardware supports 30 or 60 fps) |
+| `jpeg_quality` | `80` | JPEG encode quality; lower values reduce CPU if needed |
+
+**Verify the camera device before launching:**
+```bash
+v4l2-ctl --device=/dev/video4 --list-formats-ext
+```
+The stereo camera outputs `MJPG` at `1280x480` (30 fps) or `2560x960` (30/60 fps for the full sensor). If it appears on a different device node, update `device` in `stereo.launch.py`.
+
+**Foxglove visualization:** open `ws://localhost:8765` and add two **Image** panels — subscribe one to `/stereo/left/image_raw/compressed` and the other to `/stereo/right/image_raw/compressed`.
+
+> **Calibration:** `camera_info` messages are published with zeroed intrinsics. Proper stereo calibration (checkerboard + `camera_calibration` ROS package) is required before running any stereo depth algorithms.
+
+---
 
 ## Recording and replay
 
