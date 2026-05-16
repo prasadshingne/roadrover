@@ -203,6 +203,22 @@ session_<ts>_chunks/
   chunk_001/ ...
 ```
 
+## Tests
+
+Unit tests cover the perception components that have historically caused hard-to-debug failures. Run with the system Python (not Anaconda/conda) so the ROS pytest plugins load correctly:
+
+```bash
+python3 -m pytest tests/ -v
+```
+
+| Test file | What it covers |
+|-----------|---------------|
+| `tests/test_lane_tracker.py` | `LaneTracker._fit()` rejection gates (the staircase-bug fix), `bev_lateral()` self-calibrating scale, EMA smoothing, stale-frame counter |
+| `tests/test_lane_offset.py` | Ego ENU position formula — regression guard against reverting to the old snap=left-boundary convention that placed the ego one full lane width off-road |
+| `tests/test_ego_state.py` | Speed from velocity components, heading derivation, yaw-rate angle unwrapping at ±π, longitudinal acceleration EMA, MIN_SPEED gate |
+
+These tests have no dependency on ROS at runtime — ROS types are stubbed out in `tests/conftest.py`.
+
 ## Offline perception pipeline
 
 `src/roadrover_perception/scripts/process_bag.py` reads an original recorded bag, runs the full perception stack, and writes a new bag:
