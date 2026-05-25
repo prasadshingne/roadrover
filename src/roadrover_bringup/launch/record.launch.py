@@ -91,7 +91,9 @@ def generate_launch_description():
                 'frame_id': 'gps_berry',
                 'use_GNSS_time': False,
             }],
-            remappings=[('/fix', '/fix_berry')],
+            # Relative source name required: node is in 'berry' namespace so its
+            # topic is /berry/fix; an absolute '/fix' remapping would never match.
+            remappings=[('fix', '/fix_berry')],
             output='screen',
         ),
 
@@ -117,7 +119,8 @@ def generate_launch_description():
         ),
 
         ExecuteProcess(
-            cmd=['ros2', 'bag', 'record', '--output', bag_path] + topics,
+            cmd=['ros2', 'bag', 'record', '--output', bag_path,
+                 '--max-bag-duration', '30'] + topics,
             output='screen',
         ),
     ])

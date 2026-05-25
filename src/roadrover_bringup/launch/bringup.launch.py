@@ -73,7 +73,9 @@ def generate_launch_description():
                 'frame_id': 'gps_berry',
                 'use_GNSS_time': False,
             }],
-            remappings=[('/fix', '/fix_berry')],
+            # Relative source name required: node is in 'berry' namespace so its
+            # topic is /berry/fix; an absolute '/fix' remapping would never match.
+            remappings=[('fix', '/fix_berry')],
             output='screen',
         ),
 

@@ -15,9 +15,11 @@ A ROS 2 Humble project for data collection, offline perception, lane detection, 
 
 | Device | Default path |
 |--------|-------------|
-| USB camera (monocular) | `/dev/video4` |
+| USB camera (monocular) | `/dev/video0` |
 | Stereo USB camera (OV9715 dual-lens) | `/dev/video4` |
-| GPS receiver (NMEA serial) | `/dev/ttyUSB0` |
+| GPS receiver (NMEA serial, USB) | `/dev/ttyUSB0` at 4800 baud |
+| BerryGPS-IMU-4 GPS (NMEA serial, UART) | `/dev/ttyAMA0` at 9600 baud |
+| BerryGPS-IMU-4 IMU + barometer | I2C bus 1 |
 
 ## Prerequisites
 
@@ -74,8 +76,10 @@ This starts three nodes:
 
 | Node | Package | Topic(s) |
 |------|---------|----------|
-| `usb_cam` | `usb_cam` | `/usb_cam/image_raw`, `/usb_cam/camera_info` |
+| `usb_cam` | `usb_cam` | `/usb_cam/image_raw/compressed`, `/usb_cam/camera_info` |
 | `nmea_navsat_driver` | `nmea_navsat_driver` | `/fix`, `/vel`, `/time_reference` |
+| `nmea_navsat_driver_berry` | `nmea_navsat_driver` | `/fix_berry` (BerryGPS UART) |
+| `berry_imu_node` | `roadrover_imu` | `/imu/raw` (100 Hz), `/imu/baro` (10 Hz) |
 | `foxglove_bridge` | `foxglove_bridge` | WebSocket on port **8765** |
 
 ### Visualize with Foxglove Studio
@@ -142,9 +146,12 @@ Starts all sensors and records the following topics to `~/roadrover_bags/session
 |-------|---------|
 | `/usb_cam/image_raw/compressed` | Compressed camera frames (MJPEG) |
 | `/usb_cam/camera_info` | Camera calibration |
-| `/fix` | GPS position (NavSatFix) |
+| `/fix` | GPS position — USB receiver (NavSatFix, ~1 Hz) |
 | `/vel` | GPS velocity (TwistStamped) |
 | `/time_reference` | GPS time |
+| `/fix_berry` | GPS position — BerryGPS-IMU-4 (NavSatFix, ~1 Hz) |
+| `/imu/raw` | IMU — BerryGPS-IMU-4 angular velocity + linear acceleration (100 Hz) |
+| `/imu/baro` | Barometric pressure — BerryGPS-IMU-4 (10 Hz) |
 
 The bag auto-splits into a new file every **30 seconds** (`--max-bag-duration 30`), keeping each file manageable for offline processing. Typical bag size is ~1 GB per 10 minutes of driving.
 
@@ -154,19 +161,18 @@ Stop recording with **Ctrl-C**. The bag is fully written before the process exit
 
 ### Replay a session
 
-**Terminal 1** — start Foxglove bridge:
 ```bash
-ros2 launch roadrover_bringup replay.launch.py
+ros2 launch roadrover_bringup replay.launch.py bag_path:=$HOME/roadrover_bags/session_<timestamp>
 ```
 
-**Terminal 2** — play the bag:
-```bash
-ros2 bag play ~/roadrover_bags/session_<timestamp>
-```
+This starts Foxglove bridge and plays the bag together. Then open Foxglove Studio at `ws://localhost:8765`.
 
-Then open Foxglove Studio at `ws://localhost:8765`. Useful playback flags:
-
+For playback control, play the bag manually instead:
 ```bash
+# Start bridge only
+ros2 launch roadrover_bringup replay.launch.py bag_path:=$HOME/roadrover_bags/session_<timestamp>
+
+# Useful flags
 ros2 bag play <path> --rate 0.5          # half speed
 ros2 bag play <path> --start-offset 30  # skip first 30 s
 ros2 bag play <path> --loop             # repeat continuously
@@ -261,7 +267,7 @@ python3 src/roadrover_perception/scripts/process_bag.py <bag> --output <out_bag>
 
 ### Ego state signals
 
-All signals are derived from the GPS `/vel` topic (no IMU on this rover):
+All signals are currently derived from the GPS `/vel` topic. The BerryGPS-IMU-4 now provides `/imu/raw` at 100 Hz, which will be fused with GPS via an EKF (e.g. `robot_localization`) to give smooth high-frequency pose estimates between 1 Hz GPS fixes.
 
 | Signal | Source | Method |
 |--------|--------|--------|
@@ -429,17 +435,24 @@ esmini --osc scenario.xosc --window 60 60 1200 800
 
 ## Changing device paths
 
-If your camera or GPS receiver is on a different device node, edit the parameters in
-[src/roadrover_bringup/launch/bringup.launch.py](src/roadrover_bringup/launch/bringup.launch.py):
+If your camera or GPS receiver is on a different device node, override the defaults as launch arguments or edit [src/roadrover_bringup/launch/bringup.launch.py](src/roadrover_bringup/launch/bringup.launch.py):
 
-```python
-# Camera
-'video_device': '/dev/video4',   # change to your device, e.g. /dev/video0
-
-# GPS
-'port': '/dev/ttyUSB0',          # change to your device, e.g. /dev/ttyUSB1
-'baud': 4800,                    # change if your receiver uses a different baud rate
+```bash
+# Override at launch time
+ros2 launch roadrover_bringup bringup.launch.py \
+    video_device:=/dev/video0 \
+    gps_port:=/dev/ttyUSB1 \
+    berry_gps_port:=/dev/ttyAMA1 \
+    berry_gps_baud:=9600
 ```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `video_device` | `/dev/video0` | USB camera device |
+| `gps_port` | `/dev/ttyUSB0` | USB GPS serial port |
+| `gps_baud` | `4800` | USB GPS baud rate |
+| `berry_gps_port` | `/dev/ttyAMA0` | BerryGPS UART serial port |
+| `berry_gps_baud` | `9600` | BerryGPS baud rate |
 
 Rebuild after any changes:
 
