@@ -16,10 +16,11 @@ End-to-end setup for running RoadRover data recording on a Raspberry Pi 4 with a
 8. [Install RoadRover](#7-install-roadrover)
 9. [Fix camera device path](#8-fix-camera-device-path)
 10. [Fix device permissions](#9-fix-device-permissions)
-11. [WiFi hotspot setup](#10-wifi-hotspot-setup-iphone--mobile-hotspot)
-12. [Running RoadRover](#11-running-roadrover)
-13. [Replaying bags on a laptop](#12-replaying-bags-on-a-laptop)
-14. [Troubleshooting](#troubleshooting)
+11. [BerryGPS-IMU-4 setup](#10-berrygps-imu-4-setup)
+12. [WiFi hotspot setup](#11-wifi-hotspot-setup-iphone--mobile-hotspot)
+13. [Running RoadRover](#12-running-roadrover)
+14. [Replaying bags on a laptop](#13-replaying-bags-on-a-laptop)
+15. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -31,6 +32,7 @@ End-to-end setup for running RoadRover data recording on a Raspberry Pi 4 with a
 | Micro SD card | **64 GB minimum** — see [SD card sizing](#sd-card-sizing) |
 | USB camera | Logitech C920 (appears as `/dev/video0`) |
 | GPS receiver | NMEA serial over USB (`/dev/ttyUSB0`, 4800 baud) |
+| BerryGPS-IMU-4 | GPS on `/dev/ttyAMA0` (9600 baud), IMU + barometer on I2C bus 1 |
 
 ### SD card sizing
 
@@ -130,6 +132,8 @@ sudo apt install -y \
   ros-humble-foxglove-bridge \
   ros-humble-rosbag2 \
   ros-humble-rosbag2-storage-default-plugins
+
+pip3 install smbus2
 ```
 
 ---
@@ -182,7 +186,48 @@ sudo usermod -aG video $USER
 
 ---
 
-## 10. WiFi hotspot setup (iPhone / mobile hotspot)
+## 10. BerryGPS-IMU-4 setup
+
+The BerryGPS-IMU-4 GPS uses `/dev/ttyAMA0` (the Pi's primary hardware UART). By default this UART is claimed by the Bluetooth stack — it must be freed before the GPS driver can use it.
+
+### Disable Bluetooth and free the UART
+
+```bash
+echo 'dtoverlay=disable-bt' | sudo tee -a /boot/firmware/config.txt
+sudo systemctl disable hciuart
+sudo reboot
+```
+
+After reboot, verify the UART mapping has flipped:
+
+```bash
+ls -la /dev/serial*
+# serial0 -> ttyAMA0   ← correct (was ttyS0 before)
+# serial1 -> ttyS0
+```
+
+### Fix ttyAMA0 permissions
+
+After disabling Bluetooth the kernel assigns `/dev/ttyAMA0` to group `tty` with write-only permission. Create a udev rule to give `dialout` read+write access permanently:
+
+```bash
+sudo tee /etc/udev/rules.d/99-ttyAMA0.rules <<'EOF'
+KERNEL=="ttyAMA0", GROUP="dialout", MODE="0660"
+EOF
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+### Verify NMEA data
+
+```bash
+cat /dev/ttyAMA0
+# Should stream NMEA sentences: $GNRMC, $GNGGA, $GPGSV, etc.
+# Fix takes 1–5 minutes outdoors from cold start.
+```
+
+---
+
+## 11. WiFi hotspot setup (iPhone / mobile hotspot)
 
 Create the netplan config:
 
@@ -220,7 +265,7 @@ arp -a
 
 ---
 
-## 11. Running RoadRover
+## 12. Running RoadRover
 
 **Live preview only (Foxglove, no recording):**
 
@@ -245,19 +290,18 @@ Stop with **Ctrl-C**.
 
 ---
 
-## 12. Replaying bags on a laptop
+## 13. Replaying bags on a laptop
 
-On the laptop (with ROS 2 Humble and foxglove_bridge installed):
+Copy the bag from the Pi (or mount the SD card) then replay with a single command:
 
 ```bash
-# Terminal 1 — start bridge
-ros2 run foxglove_bridge foxglove_bridge
-
-# Terminal 2 — play bag
-ros2 bag play ~/path/to/session_folder
+ros2 launch roadrover_bringup replay.launch.py \
+    bag_path:=$HOME/roadrover_bags/session_<timestamp>
 ```
 
 Connect Foxglove Studio to `ws://localhost:8765`.
+
+> If the bag is missing `metadata.yaml` (recording interrupted), regenerate it first: `ros2 bag reindex ~/roadrover_bags/session_<timestamp> --storage sqlite3`
 
 ---
 
@@ -293,6 +337,18 @@ This is harmless for ROS 2-only workloads but can cause subtle issues. Open a fr
 source /opt/ros/humble/setup.bash
 source ~/roadrover/install/setup.bash
 ```
+
+### BerryGPS `/fix_berry` topic has 0 messages
+
+The Pi 4's primary UART (`/dev/ttyAMA0`) is claimed by Bluetooth by default. If `hciuart.service` is running, the GPS driver opens the port but receives garbage and never publishes. Follow [step 10](#10-berrygps-imu-4-setup) to disable Bluetooth and free the UART.
+
+After the fix, verify NMEA data is flowing before recording:
+
+```bash
+cat /dev/ttyAMA0   # should show $GNRMC, $GNGGA, etc.
+```
+
+If you see `Permission denied`, apply the udev rule in step 10. If the device shows `serial0 -> ttyS0` (not `ttyAMA0`), the `disable-bt` overlay hasn't taken effect — confirm `dtoverlay=disable-bt` is in `/boot/firmware/config.txt` and reboot.
 
 ### GPS not producing velocity
 
