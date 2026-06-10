@@ -1,0 +1,12 @@
+# Offline perception pipeline
+numpy<2
+scipy
+opencv-python
+osmnx
+shapely
+scenariogeneration
+ultralytics
+
+# Studio server (tools/studio_server.py)
+fastapi
+uvicorn
