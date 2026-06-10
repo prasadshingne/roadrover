@@ -38,9 +38,11 @@ COMPRESSED_TOPIC = '/usb_cam/image_raw/compressed'
 RAW_TOPIC        = '/usb_cam/image_raw'
 ANNOTATED_TOPIC  = '/perception/image_annotated'
 VEL_TOPIC        = '/vel'
+IMU_TOPIC             = '/imu/raw'
 GPS_TOPIC             = '/fix'
 EGO_ODOM_TOPIC        = '/ego/odometry'
 EGO_IMU_TOPIC         = '/ego/imu'
+FILTERED_ODOM_TOPIC   = '/odometry/filtered'
 EGO_MATCHED_FIX_TOPIC = '/ego/matched_fix'
 EGO_LANE_INFO_TOPIC   = '/ego/lane_info'
 MAP_LANES_TOPIC       = '/map/lanes'
@@ -107,6 +109,8 @@ class MapMatcher:
     Lane estimation assumes right-hand traffic; uses module-level LANE_WIDTH.
     """
 
+    MATCH_MAX_DIST_M = 15.0   # reject matches when GPS is farther than this from the edge
+
     def __init__(self, graph_path: str):
         import osmnx as ox
         with open(graph_path, 'rb') as f:
@@ -138,7 +142,9 @@ class MapMatcher:
               bev_d_left_m: float = None, ego_heading: float = 0.0,
               heading_valid: bool = True):
         """
-        Returns (matched_NavSatFix, lane_info_String, (enu_x, enu_y)).
+        Returns (matched_NavSatFix, lane_info_String, (enu_x, enu_y), match_ok).
+        match_ok is False when the GPS point is farther than MATCH_MAX_DIST_M from
+        every mapped road — then the fix/ENU are the raw GPS values, unsnapped.
         bev_d_left_m: ego's distance in metres from the detected left lane boundary
                       (from LaneTracker.bev_lateral()); used to refine lane number.
         ego_heading:  ENU yaw (rad) from /vel; used to resolve edge-direction ambiguity.
@@ -230,11 +236,38 @@ class MapMatcher:
                 tx, ty     = -tx, -ty          # flip tangent so perp is also correct
                 lateral_m  = -lateral_m
         else:
-            # Edge has no geometry: use node positions as snap point
+            # Edge has no geometry: use node positions as snap point.
+            # Compute the real distance — reporting 0.0 here used to defeat
+            # the unmatched-rejection gate below.
             node_data  = G.nodes[u]
             snap_lat   = node_data['y']
             snap_lon   = node_data['x']
-            lateral_m  = 0.0
+            lateral_m  = math.sqrt(
+                ((lat - snap_lat) * 111_320.0) ** 2 +
+                ((lon - snap_lon) * 111_320.0 * math.cos(math.radians(lat))) ** 2)
+
+        # ── Reject matches far from any mapped road ─────────────────────────
+        # GPS cold-start error can exceed 90 m (seen in session 20260528
+        # chunk_000); snapping to a road that far away teleports the ego to
+        # the wrong street.  Return the raw GPS fix unsnapped instead.
+        if abs(lateral_m) > self.MATCH_MAX_DIST_M:
+            self._enu_ema = None   # don't blend stale snaps when matching resumes
+            h = Header()
+            h.frame_id      = 'map'
+            h.stamp.sec     = int(timestamp_ns // 1_000_000_000)
+            h.stamp.nanosec = int(timestamp_ns %  1_000_000_000)
+            fix               = NavSatFix()
+            fix.header        = h
+            fix.latitude      = lat
+            fix.longitude     = lon
+            fix.status.status = 0
+            info      = String()
+            info.data = (f'unmatched — nearest road ({name}) is '
+                         f'{abs(lateral_m):.0f} m away; using raw GPS')
+            cos_lat0 = math.cos(math.radians(self.lat0))
+            gx = (lon - self.lon0) * cos_lat0 * 111_320.0
+            gy = (lat - self.lat0) * 111_320.0
+            return fix, info, (gx, gy), False
 
         # ── Lane estimate ───────────────────────────────────────────────────
         lanes_raw = edge.get('lanes', 2)
@@ -342,7 +375,7 @@ class MapMatcher:
         info.data = (f'{name} | lane {lane_num}/{total_lanes} [{method}] | '
                      f'gps_offset {lateral_m:+.1f} m{bev_str}')
 
-        return fix, info, (lane_enu_x, lane_enu_y)
+        return fix, info, (lane_enu_x, lane_enu_y), True
 
 
 # ── Ego state estimation ──────────────────────────────────────────────────────
@@ -433,6 +466,138 @@ class EgoStateEstimator:
         imu.linear_acceleration.y     = self.lat_accel
 
         return odom, imu
+
+
+# ── IMU EKF estimator ────────────────────────────────────────────────────────
+
+class ImuEkfEstimator:
+    """
+    3-state EKF: [x, y, psi] in ENU frame.
+    Predict at 100 Hz via IMU gyro_z + last known forward speed.
+    Update at 1 Hz via GPS NavSatFix (x, y) and GPS-velocity heading.
+    """
+    _Q_XY_PER_S  = 0.5    # position process noise σ²/s (m²/s) — speed uncertainty
+    _Q_PSI_PER_S = 2e-3   # heading process noise σ²/s (rad²/s) — gyro drift
+    _R_GPS_XY    = 100.0  # GPS position measurement noise σ² (m²) → ~10 m std
+    _R_VEL_PSI   = 0.04   # GPS-velocity heading noise σ² (rad²) → ~0.2 rad std
+    _MIN_SPEED   = 0.5    # m/s — below this, GPS-velocity heading is unreliable
+
+    def __init__(self, lat0: float, lon0: float):
+        self.lat0       = lat0
+        self.lon0       = lon0
+        self._cos_lat0  = math.cos(math.radians(lat0))
+        self._x         = np.zeros(3)          # [x_enu, y_enu, psi]
+        self._P         = np.diag([200.0, 200.0, math.pi ** 2])
+        self._v         = 0.0                  # last known forward speed (m/s)
+        self._t_ns_prev = None
+        self._initialized = False
+
+    def _to_enu(self, lat: float, lon: float):
+        x = (lon - self.lon0) * self._cos_lat0 * 111_320.0
+        y = (lat - self.lat0) * 111_320.0
+        return x, y
+
+    @property
+    def is_initialized(self) -> bool:
+        return self._initialized
+
+    @property
+    def heading(self) -> float:
+        return self._x[2]
+
+    @property
+    def enu_xy(self):
+        return self._x[0], self._x[1]
+
+    @property
+    def speed(self) -> float:
+        return self._v
+
+    def initialize(self, lat: float, lon: float, heading: float, speed: float):
+        x, y = self._to_enu(lat, lon)
+        self._x = np.array([x, y, heading])
+        # Start near steady-state covariance (≈ sqrt(Q_xy * R_gps) per axis)
+        # so Kalman gain is ~0.09 from the first GPS update rather than 0.5.
+        self._P = np.diag([10.0, 10.0, 0.25])
+        self._v = speed
+        self._initialized = True
+
+    def predict(self, angular_velocity_z: float, timestamp_ns: int):
+        """Propagate state using gyro yaw rate and last known speed."""
+        if not self._initialized:
+            return
+        if self._t_ns_prev is None:
+            self._t_ns_prev = timestamp_ns
+            return
+        dt = (timestamp_ns - self._t_ns_prev) * 1e-9
+        self._t_ns_prev = timestamp_ns
+        if dt <= 0.0 or dt > 0.5:
+            return
+
+        x, y, psi = self._x
+        v   = self._v
+        oz  = angular_velocity_z
+
+        x_new   = x + v * math.cos(psi) * dt
+        y_new   = y + v * math.sin(psi) * dt
+        psi_new = psi + oz * dt
+
+        F = np.array([
+            [1.0, 0.0, -v * math.sin(psi) * dt],
+            [0.0, 1.0,  v * math.cos(psi) * dt],
+            [0.0, 0.0,  1.0],
+        ])
+        Q = np.diag([self._Q_XY_PER_S * dt,
+                     self._Q_XY_PER_S * dt,
+                     self._Q_PSI_PER_S * dt])
+
+        self._x = np.array([x_new, y_new, psi_new])
+        self._P = F @ self._P @ F.T + Q
+
+    def update_gps(self, lat: float, lon: float):
+        """GPS position measurement update."""
+        if not self._initialized:
+            return
+        z_x, z_y = self._to_enu(lat, lon)
+        H = np.array([[1.0, 0.0, 0.0],
+                       [0.0, 1.0, 0.0]])
+        R = np.eye(2) * self._R_GPS_XY
+        innov = np.array([z_x, z_y]) - H @ self._x
+        S = H @ self._P @ H.T + R
+        K = self._P @ H.T @ np.linalg.inv(S)
+        self._x = self._x + K @ innov
+        self._P = (np.eye(3) - K @ H) @ self._P
+
+    def update_vel(self, vx_east: float, vy_north: float):
+        """Update speed and correct heading from GPS velocity vector."""
+        speed = math.sqrt(vx_east ** 2 + vy_north ** 2)
+        self._v = speed
+        if not self._initialized or speed < self._MIN_SPEED:
+            return
+        heading = math.atan2(vy_north, vx_east)
+        err = heading - self._x[2]
+        if err >  math.pi: err -= 2 * math.pi
+        if err < -math.pi: err += 2 * math.pi
+        H = np.array([[0.0, 0.0, 1.0]])
+        S = float((H @ self._P @ H.T)[0, 0]) + self._R_VEL_PSI
+        K = (self._P @ H.T).flatten() / S
+        self._x = self._x + K * err
+        self._P = (np.eye(3) - K.reshape(3, 1) @ H) @ self._P
+
+    def to_odometry(self, timestamp_ns: int) -> Odometry:
+        odom = Odometry()
+        odom.header.frame_id      = 'map'
+        odom.header.stamp.sec     = int(timestamp_ns // 1_000_000_000)
+        odom.header.stamp.nanosec = int(timestamp_ns %  1_000_000_000)
+        odom.child_frame_id       = 'base_link'
+        psi  = self._x[2]
+        half = psi / 2.0
+        odom.pose.pose.position.x    = self._x[0]
+        odom.pose.pose.position.y    = self._x[1]
+        odom.pose.pose.orientation.z = math.sin(half)
+        odom.pose.pose.orientation.w = math.cos(half)
+        odom.twist.twist.linear.x    = self._v
+        return odom
 
 
 # ── Lane detection ────────────────────────────────────────────────────────────
@@ -626,13 +791,6 @@ def detect_lanes(img: np.ndarray, tracker: LaneTracker,
     h, w = img.shape[:2]
     overlay = np.zeros_like(img)
 
-    # ── Edge detection ───────────────────────────────────────────────────────
-    gray     = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-    blur     = cv2.GaussianBlur(enhanced, (7, 7), 0)
-    edges    = cv2.Canny(blur, 40, 120)
-
     # ── Trapezoid ROI mask ───────────────────────────────────────────────────
     # y_top=45%: below horizon (noisy far-field); y_bottom=63%: above hood.
     # Top corners shifted right to account for camera ~5–6" left of centreline.
@@ -646,7 +804,25 @@ def detect_lanes(img: np.ndarray, tracker: LaneTracker,
     ], np.int32)
     roi_mask = np.zeros(img.shape[:2], np.uint8)
     cv2.fillPoly(roi_mask, [roi_pts], 255)
-    masked = cv2.bitwise_and(edges, roi_mask)
+
+    # ── Edge detection gated by white-paint mask ────────────────────────────
+    # Canny alone fires on vegetation/shoulder/shadow edges, which can out-vote
+    # the lane paint in the sliding-window histogram (verified on session
+    # 20260528 ramp frames).  Keeping only edges that sit on bright pixels
+    # (top-10% lightness within the ROI, and clearly above the road tone)
+    # isolates painted lane lines.  No CLAHE: it amplifies off-road texture.
+    gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur  = cv2.GaussianBlur(gray, (7, 7), 0)
+    edges = cv2.Canny(blur, 40, 120)
+
+    L = cv2.cvtColor(img, cv2.COLOR_BGR2HLS)[:, :, 1]
+    road_vals = L[roi_mask > 0]
+    thr = max(float(np.percentile(road_vals, 90)),
+              float(np.median(road_vals)) + 25.0)
+    white = (L >= thr).astype(np.uint8) * 255
+    white = cv2.dilate(white, np.ones((5, 5), np.uint8))
+
+    masked = cv2.bitwise_and(cv2.bitwise_and(edges, white), roi_mask)
 
     # ── Blank out detected vehicles so their edges don't fool the lane fit ───
     if det_boxes is not None and len(det_boxes):
@@ -727,7 +903,9 @@ def lanes_geojson_to_markers(geojson_path: str, lat0: float, lon0: float) -> Mar
 
         m = Marker()
         m.header.frame_id = 'map'
-        m.ns    = 'lanes'
+        # Namespace by boundary type so each can be toggled independently in
+        # the Lichtblick 3D panel (e.g. hide the yellow 'center' lines).
+        m.ns    = btype
         m.id    = idx
         m.type  = Marker.LINE_STRIP
         m.action = Marker.ADD
@@ -956,6 +1134,49 @@ def main():
         shutil.rmtree(out)
         print(f'Removed existing output bag.')
 
+    # Validate map graph covers the bag's GPS location before loading YOLO.
+    if args.map_graph:
+        _r = rosbag2_py.SequentialReader()
+        _r.open(rosbag2_py.StorageOptions(uri=bag_path, storage_id='sqlite3'),
+                rosbag2_py.ConverterOptions('', ''))
+        _tm = {t.name: t.type for t in _r.get_all_topics_and_types()}
+        _first_fix = None
+        while _r.has_next() and _first_fix is None:
+            _topic, _data, _ = _r.read_next()
+            if _topic == '/fix':
+                _msg = deserialize_message(_data, get_message(_tm[_topic]))
+                if _msg.status.status >= 0:
+                    _first_fix = (_msg.latitude, _msg.longitude)
+        del _r
+        if _first_fix:
+            import pickle as _pkl, numpy as _np
+            with open(args.map_graph, 'rb') as _f:
+                _G = _pkl.load(_f)
+            _lats = [d['y'] for _, d in _G.nodes(data=True)]
+            _lons = [d['x'] for _, d in _G.nodes(data=True)]
+            _min_lat, _max_lat = min(_lats), max(_lats)
+            _min_lon, _max_lon = min(_lons), max(_lons)
+            _margin = 0.01  # ~1 km slop at map edges
+            _inside = (
+                _min_lat - _margin <= _first_fix[0] <= _max_lat + _margin and
+                _min_lon - _margin <= _first_fix[1] <= _max_lon + _margin
+            )
+            print(f'Map graph bbox:    {_min_lat:.5f}–{_max_lat:.5f}, {_min_lon:.5f}–{_max_lon:.5f}')
+            print(f'Bag first GPS fix: {_first_fix[0]:.5f}, {_first_fix[1]:.5f}')
+            if not _inside:
+                _clat, _clon = _np.mean(_lats), _np.mean(_lons)
+                _cos = math.cos(math.radians(_clat))
+                _dist = math.sqrt(
+                    ((_first_fix[0] - _clat) * 111_320) ** 2 +
+                    ((_first_fix[1] - _clon) * 111_320 * _cos) ** 2
+                )
+                raise SystemExit(
+                    f'ERROR: bag GPS fix ({_first_fix[0]:.5f}, {_first_fix[1]:.5f}) is outside '
+                    f'the map graph bbox ({_min_lat:.5f}–{_max_lat:.5f}, {_min_lon:.5f}–{_max_lon:.5f}). '
+                    f'Map centroid is {_dist/1000:.1f} km away. '
+                    f'Build or specify a map graph covering ({_first_fix[0]:.5f}, {_first_fix[1]:.5f}).'
+                )
+
     print('Loading YOLOv8s on GPU...')
     from ultralytics import YOLO
     model = YOLO('yolov8s.pt')
@@ -994,9 +1215,15 @@ def main():
         type='sensor_msgs/msg/Imu',
         serialization_format='cdr',
     ))
+    writer.create_topic(rosbag2_py.TopicMetadata(
+        name=FILTERED_ODOM_TOPIC,
+        type='nav_msgs/msg/Odometry',
+        serialization_format='cdr',
+    ))
 
-    map_matcher   = None
-    lane_markers  = None
+    map_matcher        = None
+    lane_markers       = None
+    lane_markers_written = False   # write once at first GPS fix, not every fix
     if args.map_graph:
         print(f'Loading map graph: {args.map_graph}')
         map_matcher = MapMatcher(args.map_graph)
@@ -1055,104 +1282,122 @@ def main():
     speed_ms       = 0.0
     frame_count    = 0
     total          = 0
-    ego_heading    = 0.0   # tracks latest heading for ego marker (from /vel)
-    gps_heading    = None  # heading from consecutive GPS positions (fallback)
+    ego_heading    = 0.0   # tracks latest heading (updated from EKF or GPS vel)
+    gps_heading    = None  # heading from consecutive GPS positions (for map edge direction)
     prev_gps_lat   = None
     prev_gps_lon   = None
     bev_d_left     = None  # metres from detected left lane boundary (updated per frame)
-    latest_ego_x   = 0.0   # most recent ENU position from GPS (for actor projection)
-    latest_ego_y   = 0.0
-    dr_ego_x       = 0.0   # dead-reckoned ENU x (East)
-    dr_ego_y       = 0.0   # dead-reckoned ENU y (North)
-    dr_ego_init    = False # becomes True after first GPS fix places dr_ego at a valid position
-    dr_corr_x      = 0.0   # per-frame GPS correction (spread over ~30 frames to avoid 1 Hz jump)
-    dr_corr_y      = 0.0
-    dr_corr_left   = 0     # frames of correction remaining
-    prev_cam_ts    = None  # nanosecond timestamp of previous camera frame
+
+    # EKF — initialized after first GPS fix + vel pair
+    ekf_lat0 = map_matcher.lat0 if map_matcher else None
+    ekf_lon0 = map_matcher.lon0 if map_matcher else None
+    ekf: ImuEkfEstimator | None = None
+    ekf_pending_gps = None   # (lat, lon) buffered before EKF is initialized
+
+    # Lane-snap dead-reckoning: at each GPS fix we record the lane-centred ENU
+    # position and the EKF position at that instant.  Between fixes, ego pose =
+    # snap + (ekf_now - ekf_at_snap), so lateral GPS noise never affects the
+    # 3D marker position; only the smooth EKF dead-reckoning displacement is used.
+    _snap_enu      = None   # (lx, ly) from last map_matcher.match()
+    _ekf_at_snap   = None   # ekf.enu_xy at the same instant
+
 
     while reader.has_next():
         topic, data, timestamp = reader.read_next()
+
+        # Write the lane map once at the very first message so it is visible
+        # from t=0 in replay (it is static — no need to wait for a GPS fix).
+        if lane_markers is not None and not lane_markers_written:
+            h_stamp = Header()
+            h_stamp.frame_id      = 'map'
+            h_stamp.stamp.sec     = int(timestamp // 1_000_000_000)
+            h_stamp.stamp.nanosec = int(timestamp %  1_000_000_000)
+            for lm in lane_markers.markers:
+                lm.header = h_stamp
+            writer.write(MAP_LANES_TOPIC,
+                         serialize_message(lane_markers), timestamp)
+            lane_markers_written = True
 
         if topic == VEL_TOPIC:
             msg = deserialize_message(data, get_message(type_map[topic]))
             speed_ms = math.sqrt(
                 msg.twist.linear.x ** 2 + msg.twist.linear.y ** 2)
-            if speed_ms >= EgoStateEstimator._MIN_SPEED:
-                ego_heading = math.atan2(msg.twist.linear.y, msg.twist.linear.x)
             writer.write(topic, data, timestamp)
-            odom, imu = ego_est.update(msg, timestamp)
-            writer.write(EGO_ODOM_TOPIC, serialize_message(odom), timestamp)
-            writer.write(EGO_IMU_TOPIC,  serialize_message(imu),  timestamp)
+            odom_gps, imu = ego_est.update(msg, timestamp)
+            writer.write(EGO_IMU_TOPIC, serialize_message(imu), timestamp)
+            # Initialize EKF once we have both a GPS fix and a velocity
+            if ekf is None and ekf_pending_gps is not None and ekf_lat0 is not None:
+                init_heading = (math.atan2(msg.twist.linear.y, msg.twist.linear.x)
+                                if speed_ms >= ImuEkfEstimator._MIN_SPEED else 0.0)
+                ekf = ImuEkfEstimator(ekf_lat0, ekf_lon0)
+                ekf.initialize(ekf_pending_gps[0], ekf_pending_gps[1],
+                                init_heading, speed_ms)
+                ekf_pending_gps = None
+                print('EKF initialized.')
+            elif ekf is not None:
+                ekf.update_vel(msg.twist.linear.x, msg.twist.linear.y)
+                ego_heading = ekf.heading
+            # /ego/odometry: EKF heading + ENU position when available so that
+            # make_scenario.py projects actors with smooth gyro-integrated heading
+            # rather than 1 Hz GPS-differenced heading.
+            if ekf is not None and ekf.is_initialized:
+                writer.write(EGO_ODOM_TOPIC,
+                             serialize_message(ekf.to_odometry(timestamp)), timestamp)
+            else:
+                writer.write(EGO_ODOM_TOPIC, serialize_message(odom_gps), timestamp)
 
         elif topic == GPS_TOPIC:
             writer.write(topic, data, timestamp)
-            if map_matcher is not None:
-                gps_msg = deserialize_message(data, get_message(type_map[topic]))
-                if gps_msg.status.status >= 0:
-                    # GPS-track heading from consecutive fixes (robust fallback)
-                    if prev_gps_lat is not None:
-                        dlat = gps_msg.latitude  - prev_gps_lat
-                        dlon = gps_msg.longitude - prev_gps_lon
-                        if abs(dlat) + abs(dlon) > 1e-6:
-                            gps_heading = math.atan2(
-                                dlat,
-                                dlon * math.cos(math.radians(gps_msg.latitude)))
-                    prev_gps_lat = gps_msg.latitude
-                    prev_gps_lon = gps_msg.longitude
-                    heading_for_match = (gps_heading if gps_heading is not None
-                                         else ego_heading)
-                    heading_valid = speed_ms >= EgoStateEstimator._MIN_SPEED
-                    matched_fix, lane_info, (lx, ly) = map_matcher.match(
-                        gps_msg.latitude, gps_msg.longitude, timestamp,
-                        bev_d_left_m=bev_d_left,
-                        ego_heading=heading_for_match,
-                        heading_valid=heading_valid)
-                    latest_ego_x, latest_ego_y = lx, ly
-                    if not dr_ego_init:
-                        dr_ego_x, dr_ego_y = lx, ly   # first fix: place immediately
-                        dr_ego_init = True
-                    else:
-                        # Spread GPS correction over ~30 frames so actors don't jump
-                        # at 1 Hz. Dead reckoning runs each frame; this just corrects drift.
-                        _n = 30
-                        dr_corr_x    = (lx - dr_ego_x) / _n
-                        dr_corr_y    = (ly - dr_ego_y) / _n
-                        dr_corr_left = _n
-                    writer.write(EGO_MATCHED_FIX_TOPIC,
-                                 serialize_message(matched_fix), timestamp)
-                    writer.write(EGO_LANE_INFO_TOPIC,
-                                 serialize_message(lane_info), timestamp)
-                    # Ego arrow + pose snapped to lane centre in ENU 'map' frame
-                    ego_m = make_ego_marker(lx, ly, ego_heading, timestamp)
-                    writer.write(EGO_MARKER_TOPIC,
-                                 serialize_message(ego_m), timestamp)
-                    ego_ps = make_ego_pose(lx, ly, ego_heading, timestamp)
-                    writer.write(EGO_POSE_TOPIC,
-                                 serialize_message(ego_ps), timestamp)
-                    # TF: map → base_link at lane centre
-                    ts = TransformStamped()
-                    ts.header.frame_id      = 'map'
-                    ts.header.stamp.sec     = int(timestamp // 1_000_000_000)
-                    ts.header.stamp.nanosec = int(timestamp %  1_000_000_000)
-                    ts.child_frame_id       = 'base_link'
-                    ts.transform.translation.x = lx
-                    ts.transform.translation.y = ly
-                    ts.transform.translation.z = 0.0
-                    half = ego_heading / 2.0
-                    ts.transform.rotation.z = math.sin(half)
-                    ts.transform.rotation.w = math.cos(half)
-                    tf_msg = TFMessage(transforms=[ts])
-                    writer.write('/tf', serialize_message(tf_msg), timestamp)
-                    # Re-stamp and re-publish lane MarkerArray so Foxglove sees it live
-                    if lane_markers is not None:
-                        h_stamp = Header()
-                        h_stamp.frame_id      = 'map'
-                        h_stamp.stamp.sec     = int(timestamp // 1_000_000_000)
-                        h_stamp.stamp.nanosec = int(timestamp %  1_000_000_000)
-                        for lm in lane_markers.markers:
-                            lm.header = h_stamp
-                        writer.write(MAP_LANES_TOPIC,
-                                     serialize_message(lane_markers), timestamp)
+            gps_msg = deserialize_message(data, get_message(type_map[topic]))
+            if gps_msg.status.status >= 0:
+                # Buffer for EKF initialization (before first /vel arrives)
+                if ekf is None:
+                    if ekf_lat0 is None:
+                        ekf_lat0 = gps_msg.latitude
+                        ekf_lon0 = gps_msg.longitude
+                    ekf_pending_gps = (gps_msg.latitude, gps_msg.longitude)
+                else:
+                    ekf.update_gps(gps_msg.latitude, gps_msg.longitude)
+                    ego_heading = ekf.heading
+            if map_matcher is not None and gps_msg.status.status >= 0:
+                # GPS-track heading from consecutive fixes (for map edge direction)
+                if prev_gps_lat is not None:
+                    dlat = gps_msg.latitude  - prev_gps_lat
+                    dlon = gps_msg.longitude - prev_gps_lon
+                    if abs(dlat) + abs(dlon) > 1e-6:
+                        gps_heading = math.atan2(
+                            dlat,
+                            dlon * math.cos(math.radians(gps_msg.latitude)))
+                prev_gps_lat = gps_msg.latitude
+                prev_gps_lon = gps_msg.longitude
+                heading_for_match = (gps_heading if gps_heading is not None
+                                      else ego_heading)
+                heading_valid = speed_ms >= EgoStateEstimator._MIN_SPEED
+                matched_fix, lane_info, (lx, ly), match_ok = map_matcher.match(
+                    gps_msg.latitude, gps_msg.longitude, timestamp,
+                    bev_d_left_m=bev_d_left,
+                    ego_heading=heading_for_match,
+                    heading_valid=heading_valid)
+                writer.write(EGO_MATCHED_FIX_TOPIC,
+                             serialize_message(matched_fix), timestamp)
+                writer.write(EGO_LANE_INFO_TOPIC,
+                             serialize_message(lane_info), timestamp)
+                # Record lane-snap anchor for 30 Hz dead-reckoning — only when
+                # the match is trustworthy; otherwise the ego follows raw EKF.
+                if match_ok:
+                    _snap_enu    = (lx, ly)
+                    _ekf_at_snap = ekf.enu_xy if (ekf is not None and ekf.is_initialized) else None
+                else:
+                    _snap_enu    = None
+                    _ekf_at_snap = None
+
+        elif topic == IMU_TOPIC:
+            writer.write(topic, data, timestamp)
+            if ekf is not None:
+                imu_msg = deserialize_message(data, get_message(type_map[topic]))
+                ekf.predict(imu_msg.angular_velocity.z, timestamp)
+                writer.write(FILTERED_ODOM_TOPIC,
+                             serialize_message(ekf.to_odometry(timestamp)), timestamp)
 
         elif topic == RAW_TOPIC:
             # rotate raw image and write to same topic
@@ -1168,6 +1413,44 @@ def main():
             if img is not None:
                 h_img = img.shape[0]
                 hood_y = int(h_img * HOOD_CUTOFF)
+
+                # 30 Hz ego pose, marker, and TF.
+                # Dead-reckon from the last lane-snap using EKF displacement so
+                # the pose moves smoothly between 1 Hz GPS fixes with no lateral
+                # GPS noise — at fix time delta is zero and pose equals the snap.
+                # display_pose is the single source of truth for everything drawn
+                # at/relative to the ego this frame (marker, TF, actor projection).
+                display_pose = None
+                if map_matcher is not None and ekf is not None and ekf.is_initialized:
+                    if _snap_enu is not None and _ekf_at_snap is not None:
+                        dx = ekf.enu_xy[0] - _ekf_at_snap[0]
+                        dy = ekf.enu_xy[1] - _ekf_at_snap[1]
+                        ex = _snap_enu[0] + dx
+                        ey = _snap_enu[1] + dy
+                    else:
+                        ex, ey = ekf.enu_xy
+                    eh = ekf.heading
+                    display_pose = (ex, ey, eh)
+                    writer.write(EGO_POSE_TOPIC,
+                                 serialize_message(make_ego_pose(ex, ey, eh, timestamp)),
+                                 timestamp)
+                    writer.write(EGO_MARKER_TOPIC,
+                                 serialize_message(make_ego_marker(ex, ey, eh, timestamp)),
+                                 timestamp)
+                    _ts = TransformStamped()
+                    _ts.header.frame_id      = 'map'
+                    _ts.header.stamp.sec     = int(timestamp // 1_000_000_000)
+                    _ts.header.stamp.nanosec = int(timestamp %  1_000_000_000)
+                    _ts.child_frame_id       = 'base_link'
+                    _ts.transform.translation.x = ex
+                    _ts.transform.translation.y = ey
+                    _ts.transform.translation.z = 0.0
+                    _half = eh / 2.0
+                    _ts.transform.rotation.z = math.sin(_half)
+                    _ts.transform.rotation.w = math.cos(_half)
+                    writer.write('/tf',
+                                 serialize_message(TFMessage(transforms=[_ts])),
+                                 timestamp)
 
                 # YOLO first — boxes are used to mask vehicles out of lane detection
                 det_results = model(img, verbose=False)[0]
@@ -1185,19 +1468,15 @@ def main():
 
                 # actor tracking + markers (only when map-matching is active)
                 if actor_tracker is not None:
-                    # 1. Dead-reckon ego forward by one camera frame.
-                    if prev_cam_ts is not None and speed_ms > 0.1:
-                        dt = (timestamp - prev_cam_ts) / 1e9
-                        dr_ego_x += speed_ms * math.cos(ego_heading) * dt
-                        dr_ego_y += speed_ms * math.sin(ego_heading) * dt
-                    prev_cam_ts = timestamp
-                    # 2. Drip-feed GPS correction (~1/30 of total error per frame).
-                    #    Spreading the fix over 30 frames eliminates the 1 Hz jump that
-                    #    would otherwise appear in all actor ENU positions.
-                    if dr_corr_left > 0:
-                        dr_ego_x   += dr_corr_x
-                        dr_ego_y   += dr_corr_y
-                        dr_corr_left -= 1
+                    # Project actors from the SAME pose as the displayed ego
+                    # marker — using raw EKF here while the marker uses the
+                    # lane-snapped pose detaches actors from the ego by the
+                    # GPS lateral error.
+                    if display_pose is not None:
+                        act_x, act_y, act_heading = display_pose
+                    else:
+                        act_x, act_y   = 0.0, 0.0
+                        act_heading    = ego_heading
                     vehicle_dets = []
                     if det_results.boxes is not None:
                         for i in range(len(det_results.boxes)):
@@ -1207,8 +1486,8 @@ def main():
                             # at _ACT_CONF_THRESH (hysteresis prevents flicker near border).
                             if ci in _ACT_VEHICLE_CLS and fi >= _ACT_CONF_TRACK:
                                 vehicle_dets.append((det_results.boxes.xyxy[i].tolist(), ci, fi))
-                    actor_tracker.update(vehicle_dets, dr_ego_x, dr_ego_y, ego_heading)
-                    actor_ma = actor_tracker.active_markers(timestamp, ego_heading)
+                    actor_tracker.update(vehicle_dets, act_x, act_y, act_heading)
+                    actor_ma = actor_tracker.active_markers(timestamp, act_heading)
                     writer.write(ACTORS_TOPIC, serialize_message(actor_ma), timestamp)
 
                 # compose: smoothed vehicle boxes + non-vehicle detections + lane overlay

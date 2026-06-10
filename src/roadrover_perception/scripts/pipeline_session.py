@@ -167,6 +167,8 @@ def main():
                     help='YOLOv8 weights file (default: yolov8s.pt)')
     ap.add_argument('--yes', action='store_true',
                     help='Skip confirmation prompt')
+    ap.add_argument('--split-only', action='store_true',
+                    help='Download map and split into chunks without running perception')
     args = ap.parse_args()
 
     session_dir = Path(args.bag_path).resolve()
@@ -218,6 +220,10 @@ def main():
     n_process = sum(1 for c in chunks if not c['skip'])
     n_skip    = len(chunks) - n_process
     print(f'  {n_process} chunk(s) will be processed, {n_skip} skipped.\n')
+
+    if args.split_only:
+        print('Split-only mode — done. Use per-chunk processing to run perception.')
+        sys.exit(0)
 
     if not args.yes:
         ans = input('Proceed? [y/N] ').strip().lower()
