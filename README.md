@@ -44,7 +44,13 @@ cd ~/ros2_ws/src
 git clone git@github.com:prasadshingne/roadrover.git
 ```
 
-### 2. Build
+### 2. Install Python dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Build
 
 ```bash
 cd ~/ros2_ws
@@ -52,7 +58,7 @@ source /opt/ros/humble/setup.bash
 colcon build --symlink-install
 ```
 
-### 3. Source the workspace
+### 4. Source the workspace
 
 ```bash
 source ~/ros2_ws/install/setup.bash
@@ -62,6 +68,12 @@ Add this line to `~/.bashrc` to source automatically on every terminal:
 
 ```bash
 echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
+```
+
+Also install the MCAP storage plugin for bag conversion:
+
+```bash
+sudo apt install ros-humble-rosbag2-storage-mcap
 ```
 
 ## Usage
@@ -245,10 +257,10 @@ python3 src/roadrover_perception/scripts/process_bag.py <bag> --output <out_bag>
 |------|--------|
 | Image rotation | All camera frames rotated 180° in-place |
 | Object detection | YOLOv8s on GPU; detections in the car hood region are filtered out |
-| Lane detection | Bird's-eye view (BEV) perspective warp + sliding window search; EMA-smoothed degree-2 polynomial per lane |
+| Lane detection | White-paint-gated Canny edges (HLS lightness mask drops vegetation/shoulder edges) → bird's-eye view (BEV) perspective warp → sliding window search; EMA-smoothed degree-2 polynomial per lane |
 | Ego state estimation | Heading, yaw rate, longitudinal and lateral acceleration derived from GPS velocity |
-| Map matching | GPS fix snapped to nearest OSM road edge; lane number estimated from GPS lateral offset + BEV measurement |
-| Actor tracking | IoU tracker on YOLO vehicle detections; 3D box positions projected to ENU via bounding-box-height model |
+| Map matching | GPS fix snapped to nearest OSM road edge; matches farther than 15 m are rejected (GPS cold start) and the raw fix is used instead; lane number estimated from GPS lateral offset + BEV measurement |
+| Actor tracking | IoU tracker on YOLO vehicle detections; 3D box positions projected to ENU via bounding-box-height model, anchored to the same displayed ego pose as `/ego/marker` |
 
 ### Output topics
 
@@ -262,8 +274,8 @@ python3 src/roadrover_perception/scripts/process_bag.py <bag> --output <out_bag>
 | `/ego/lane_info` | `String` | Road name, lane number, method, GPS offset, BEV offset |
 | `/ego/marker` | `Marker` (CUBE) | Car-box in ENU `map` frame, yaws with heading |
 | `/ego/pose` | `PoseStamped` | Ego pose in `map` frame |
-| `/map/lanes` | `MarkerArray` | Lane boundary LINE_STRIP markers in ENU `map` frame (cyan = interior, white = edge, yellow = centreline) |
-| `/tf` | `TFMessage` | `map → base_link` transform per GPS fix |
+| `/map/lanes` | `MarkerArray` | Lane boundary LINE_STRIP markers in ENU `map` frame, written once at bag start. Namespaced by boundary type so each can be toggled in Lichtblick: `lane` (cyan, interior), `edge` (white), `center` (yellow centreline) |
+| `/tf` | `TFMessage` | `map → base_link` transform at 30 Hz (per camera frame) |
 
 ### Ego state signals
 
@@ -289,7 +301,9 @@ The localization runs in two stages per GPS fix:
 
 1. **GPS snap** — the raw fix is projected onto the nearest OSM road edge to get the road position along the route. On divided highways `ox.nearest_edges()` can return the opposing carriageway; if the nearest edge's tangent strongly opposes ego heading (dot product < −0.3), the matcher searches all edges within 30 m for the closest heading-consistent alternative (dot > 0.3) and uses that instead.
 
-2. **Lane-centre placement** — the snap point is EMA-smoothed (α = 0.6) to absorb GPS-fix jitter, then offset laterally to the detected lane centre using:
+   **Match rejection:** if the fix is farther than 15 m from the matched edge, the match is rejected — `/ego/lane_info` reports `unmatched — nearest road (X) is N m away; using raw GPS` and the raw fix is used unsnapped. This guards against GPS cold start (errors up to ~200 m in the first seconds of a session) teleporting the ego onto the wrong street.
+
+2. **Lane-centre placement** — the snap point is EMA-smoothed (α = 0.4) to absorb GPS-fix jitter, then offset laterally to the detected lane centre using:
 
    ```
    ego_x = snap_x + (N − lane_num + 0.5) × LANE_WIDTH × sin(heading)
@@ -321,7 +335,7 @@ Open the processed bag in Foxglove Studio (File → Open local file). Useful pan
 | Longitudinal accel | `/ego/imu` | `linear_acceleration.x` |
 | Lateral accel | `/ego/imu` | `linear_acceleration.y` |
 
-> **Foxglove 3D tip:** the TF visualizer draws a connection line between the `map` origin and `base_link`. To hide it, open the panel settings → **Transforms** → uncheck **Show connection lines**.
+> **3D panel tip:** the TF visualizer draws a yellow connector line between the `map` origin and `base_link`, which looks like a line from the ego to a far-away point. To hide it in Lichtblick: panel settings → **Transforms → Settings → Line width → 0**. To hide the yellow road centrelines: **Topics → /map/lanes** → untick the `center` namespace.
 
 ### Known limitation: 3D actor position noise
 
@@ -329,7 +343,7 @@ The orange actor boxes in the 3D view will visibly jitter. This is expected and 
 
 **1. Monocular depth estimation is noisy.** Distance is inferred from bounding-box height using a pinhole model (`d = f × H / h_px`). YOLO's detection boundaries shift 5–15% frame-to-frame even for a stationary vehicle. At 40 m range, a 10% height variation translates to ±4 m of distance error per frame — with no depth sensor to correct it, this noise is irreducible.
 
-**2. GPS anchor discontinuity.** Ego position is updated at 1 Hz from GPS and dead-reckoned between fixes using NMEA velocity. Each GPS fix carries a new lateral error (motorway GPS accuracy is ±5–15 m). When the map-matched ego position shifts at a fix boundary, all actor ENU positions shift by the same amount simultaneously, appearing as a periodic snap in the 3D view.
+**2. GPS anchor discontinuity.** The displayed ego pose is anchored to the lane-snapped position at each 1 Hz GPS fix and dead-reckoned between fixes using the EKF displacement (IMU gyro + GPS velocity), so lateral GPS noise no longer moves the ego. A residual longitudinal correction still lands at each fix boundary, and actor ENU positions (projected from the same displayed ego pose) shift with it, appearing as a small periodic snap in the 3D view.
 
 **Why not fix it?** Eliminating this properly requires hardware this rover doesn't have: a stereo camera or LiDAR for metric depth, or a radar for accurate radial distance. The tracking *identity* (which box belongs to which vehicle across frames) is correct — only the absolute 3D position estimate is noisy. Sensor fusion with any of those modalities would replace the bounding-box-height heuristic and solve both issues.
 
@@ -354,6 +368,52 @@ Output images in `/tmp/lane_debug/`:
 | `6_bev_windows.jpg` | Sliding windows in BEV |
 | `7_bev_fit.jpg` | Polynomial fit in BEV |
 | `8_lane_overlay.jpg` | Lanes warped back to image space |
+
+## Studio server and Lichtblick layout
+
+`tools/studio_server.py` is a local HTTP server that provides a session management UI inside Lichtblick via a built-in **Web browser** panel — no extension installation required.
+
+### First-time Lichtblick setup
+
+1. Start Lichtblick
+2. **File → Import layout → `roadrover_layout.json`** — the layout ("roadrover_layout") now appears in the dropdown permanently
+
+### Daily use
+
+```bash
+# In a ROS 2 sourced terminal
+python3 tools/studio_server.py
+```
+
+Open **http://localhost:8765** in a browser for the session manager. Select the **roadrover_layout** in Lichtblick for visualization panels (annotated image, 3D scene, raw image, speed plot).
+
+The session manager shows all sessions with one-click actions.
+
+**Session-level** (header row):
+
+| Action | What it does |
+|--------|-------------|
+| **Split** | Download map + split into 30 s chunks without running perception |
+| **Process all** | Run full pipeline on all moving chunks: split → YOLO → lanes → EKF |
+| **Extract scenario** | Run `make_scenario.py` on all processed chunks |
+| **→ MCAP raw / → MCAP proc** | Bulk-convert raw or processed db3 bags to MCAP (skips already-converted chunks) |
+
+**Per-chunk** (expand a session):
+
+| Action | What it does |
+|--------|-------------|
+| **Process / Reprocess** | Run perception on one chunk; Reprocess overwrites the existing processed bag |
+| **→ MCAP (raw) / → MCAP (proc)** | Convert that chunk to MCAP; always overwrites (use after a Reprocess) |
+| **Copy raw/proc MCAP** | Copy the MCAP URL → paste in Lichtblick File → Open → Remote file |
+| **▶ ESMini** | Launch ESMini with the chunk's OpenSCENARIO file |
+
+Requires the MCAP storage plugin for conversions: `sudo apt install ros-humble-rosbag2-storage-mcap`.
+
+Optional arguments:
+
+```bash
+python3 tools/studio_server.py --bags-dir ~/roadrover_bags --port 8765
+```
 
 ## OSM map pipeline
 

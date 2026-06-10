@@ -8,9 +8,19 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .eggs/
+.venv/
 
 # Editor
 .vscode/
 .idea/
 *.swp
 *~
+
+# Model weights and OSM download caches
+yolov8s.pt
+cache/
+
+# Lichtblick extension build artifacts
+lichtblick-extension/node_modules/
+lichtblick-extension/dist/
+lichtblick-extension/*.foxe
