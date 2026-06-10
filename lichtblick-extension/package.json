@@ -1,0 +1,26 @@
+{
+  "name": "roadrover-session-manager",
+  "displayName": "Roadrover Session Manager",
+  "description": "Select, process, and replay roadrover recording sessions from within Lichtblick",
+  "publisher": "prasadshingne",
+  "homepage": "https://github.com/prasadshingne/roadrover",
+  "version": "1.0.0",
+  "license": "MIT",
+  "main": "dist/extension.js",
+  "scripts": {
+    "build": "webpack --mode production",
+    "dev": "webpack --mode development --watch",
+    "package": "npm run build && rm -f roadrover-session-manager.foxe && zip roadrover-session-manager.foxe package.json dist/extension.js"
+  },
+  "devDependencies": {
+    "@lichtblick/suite": "latest",
+    "@types/react": "^18.0.0",
+    "@types/react-dom": "^18.0.0",
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0",
+    "ts-loader": "^9.5.0",
+    "typescript": "^5.0.0",
+    "webpack": "^5.0.0",
+    "webpack-cli": "^5.0.0"
+  }
+}

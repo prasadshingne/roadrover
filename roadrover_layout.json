@@ -1,0 +1,95 @@
+{
+  "configById": {
+    "Image!annotated": {
+      "cameraTopic": "/perception/image_annotated",
+      "calibrationTopic": "",
+      "synchronize": false,
+      "smooth": false,
+      "flipHorizontal": false,
+      "flipVertical": false,
+      "rotation": 0,
+      "zoomMode": "fit"
+    },
+    "Image!raw": {
+      "cameraTopic": "/usb_cam/image_raw/compressed",
+      "calibrationTopic": "",
+      "synchronize": false,
+      "smooth": false,
+      "flipHorizontal": false,
+      "flipVertical": false,
+      "rotation": 0,
+      "zoomMode": "fit"
+    },
+    "3D!scene": {
+      "cameraState": {
+        "distance": 25,
+        "perspective": true,
+        "phi": 55,
+        "thetaOffset": 0,
+        "fovy": 45,
+        "near": 0.01,
+        "far": 5000,
+        "target": [0, 0, 0],
+        "targetOffset": [0, 0, 0],
+        "targetOrientation": [0, 0, 0, 1]
+      },
+      "followMode": "follow-pose",
+      "followTf": "base_link",
+      "scene": {
+        "backgroundColor": "#1a1a1a",
+        "enableStats": false,
+        "labelScaleFactor": 1
+      },
+      "topics": {
+        "/perception/actors": { "visible": true },
+        "/ego/marker": { "visible": true },
+        "/ego/pose": { "visible": false },
+        "/map/lanes": { "visible": true }
+      },
+      "layers": {}
+    },
+    "Plot!speed": {
+      "title": "Speed & Heading",
+      "paths": [
+        {
+          "value": "/vel.twist.linear.x",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "GPS fwd speed (m/s)"
+        },
+        {
+          "value": "/odometry/filtered.twist.twist.linear.x",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "EKF fwd speed (m/s)"
+        }
+      ],
+      "xAxisVal": "timestamp",
+      "showLegend": true,
+      "legendDisplay": "floating",
+      "minYValue": "",
+      "maxYValue": ""
+    }
+  },
+  "globalVariables": {},
+  "layout": {
+    "direction": "column",
+    "first": {
+      "direction": "row",
+      "first": "Image!annotated",
+      "second": "3D!scene",
+      "splitPercentage": 55
+    },
+    "second": {
+      "direction": "row",
+      "first": "Image!raw",
+      "second": "Plot!speed",
+      "splitPercentage": 55
+    },
+    "splitPercentage": 68
+  },
+  "userNodes": {},
+  "playbackConfig": {
+    "speed": 1.0
+  }
+}
